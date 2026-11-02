@@ -1,0 +1,32 @@
+﻿# Pico SDK build artifacts
+firmware/build/
+*.uf2
+*.elf
+*.bin
+*.map
+*.dis
+
+# Certificados TLS — nunca subir chaves privadas
+ca.key
+server.key
+*.key
+ca.srl
+
+# Gerado automaticamente pelo gen_certs.sh
+ca_cert.h
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

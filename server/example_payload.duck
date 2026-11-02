@@ -1,0 +1,33 @@
+REM ── example_payload.duck ───────────────────────────────────────────
+REM DuckyScript-like payload for the Pico W C2 agent.
+REM Run with: python3 c2_server.py --script example_payload.duck
+REM
+REM This example:
+REM   1. Opens the Windows Run dialog
+REM   2. Launches PowerShell (minimised)
+REM   3. Runs a harmless command (prints hostname + whoami)
+REM   4. Closes the window
+REM
+REM Tested against: Windows 10 / 11 (US-QWERTY layout)
+REM ────────────────────────────────────────────────────────────────────
+
+REM Open Run dialog
+GUI r
+DELAY 600
+
+REM Type the PowerShell invocation (minimised window)
+STRING powershell -WindowStyle Minimized
+ENTER
+DELAY 1200
+
+REM Wait for PowerShell to fully load
+DELAY 500
+
+REM Run a harmless recon command and write output to Desktop
+STRING $out = "Hostname: $(hostname)`nUser: $(whoami)`nIP: $(ipconfig | Select-String 'IPv4')"; $out | Out-File $env:USERPROFILE\Desktop\info.txt
+ENTER
+DELAY 500
+
+REM Close the PowerShell window
+STRING exit
+ENTER
