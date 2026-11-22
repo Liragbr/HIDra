@@ -9,6 +9,7 @@
  * exposing ONE IN endpoint (keyboard reports, 8 bytes).
  */
 
+#include <string.h>
 #include "tusb.h"
 #include "usb_descriptors.h"
 
@@ -21,7 +22,7 @@ tusb_desc_device_t const desc_device = {
     .bDeviceSubClass    = 0x00,
     .bDeviceProtocol    = 0x00,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
-    /* Raspberry Pi Foundation VID/PID — change to spoof a different device */
+    /* Laboratory VID/PID; no USB-IF product allocation is claimed. */
     .idVendor           = 0x2E8A,
     .idProduct          = 0x0004,
     .bcdDevice          = 0x0100,
@@ -51,7 +52,7 @@ uint8_t const * tud_hid_descriptor_report_cb(uint8_t instance) {
 
 uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_TOTAL_LEN,
-                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+                          0, 100),
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD,
                        sizeof(desc_hid_report), EPNUM_HID,
                        CFG_TUD_HID_EP_BUFSIZE, 10),
@@ -86,7 +87,7 @@ uint16_t const * tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         chr_count = (uint8_t)strlen(str);
         if (chr_count > 31) chr_count = 31;
         for (uint8_t i = 0; i < chr_count; i++)
-            _desc_str[1 + i] = str[i];
+            _desc_str[1 + i] = (uint8_t)str[i];
     }
     _desc_str[0] = (uint16_t)((TUSB_DESC_STRING << 8) | (2 * chr_count + 2));
     return _desc_str;

