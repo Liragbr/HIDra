@@ -34,7 +34,7 @@ idênticos byte a byte sem controlar também essas entradas.
 | Fila nativa | PASS | Capacidade útil 63, cancelamento, idle/busy; 100.000 registros FIFO entre duas threads com campos exatos |
 | LeakSanitizer local | **NOT TESTED** | Tentativa falhou por ptrace; [diagnóstico](../evidence/lsan-unavailable.log). ASan/UBSan foram executados com `detect_leaks=0` |
 | Sintaxe Python, Ruff, Bandit, sintaxe shell | PASS | [log estático](../evidence/static-analysis.log); comandos de [LAB.md](LAB.md) |
-| GCC warnings/análise do codec e fila | PASS | `-Wall -Wextra -Werror -Wconversion -Wshadow -fanalyzer -fsyntax-only` |
+| GCC warnings/análise do codec e fila | PASS | `-Wall -Wextra -Werror -Wconversion -Wshadow -fanalyzer -c` |
 | Dependências Python | PASS | `pip-audit --disable-pip --no-deps -r requirements-dev.txt`; [log](../evidence/dependency-audit.log). Resultado é consulta de advisories, não garantia absoluta |
 | Build Pico W / RP2040, verificação TLS ligada | **PASS — ELF e UF2** | [log](../evidence/build-pico_w.log), saída zero; nenhuma gravação de placa |
 | Build Pico 2 W / RP2350 Arm, verificação TLS ligada | **PASS — ELF e UF2** | [log](../evidence/build-pico2_w.log), saída zero; nenhum teste RISC-V |

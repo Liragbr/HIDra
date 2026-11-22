@@ -1,0 +1,5 @@
+Python: 3.12.14
+Platform: Linux-6.18.57-x86_64-with-glibc2.41
+OpenSSL (Python): OpenSSL 3.5.8 25 Aug 2026
+gcc (Debian 14.2.0-19) 14.2.0
+arm-none-eabi-gcc (Arm GNU Toolchain 14.3.Rel1 (Build arm-14.174)) 14.3.1 20250623

@@ -33,6 +33,8 @@ jobs:
           ruff check hidra server test scripts | tee build/results/ruff.log
           bandit -r hidra server test/pico_agent_sim.py -q | tee build/results/bandit.log
           python scripts/check_security.py | tee build/results/secrets.log
+          gcc -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow -fanalyzer -c firmware/protocol.c -o build/protocol.o
+          gcc -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow -fanalyzer -c firmware/hid_queue.c -o build/hid_queue.o
           bash -n gen_certs.sh scripts/build_firmware.sh test/run_native.sh test/run_mbedtls_host.sh
       - name: Unit and isolated TLS integration tests
         run: python -W error::ResourceWarning test/run_tests.py 2>&1 | tee build/results/tests.log
