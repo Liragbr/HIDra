@@ -43,7 +43,7 @@ jobs:
       - name: Dependency advisory check
         if: matrix.python == '3.12'
         run: pip-audit --strict --disable-pip --no-deps -r requirements-dev.txt 2>&1 | tee build/results/dependencies.log
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: python-${{ matrix.python }}-results
@@ -94,7 +94,7 @@ jobs:
       - name: Exact mbedTLS config against Python TLS server
         if: matrix.board == 'pico_w'
         run: bash test/run_mbedtls_host.sh 2>&1 | tee build/results/mbedtls-host.log
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: firmware-${{ matrix.board }}-results
