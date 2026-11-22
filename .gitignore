@@ -30,3 +30,11 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Audit builds and local provisioning
+firmware/build*/
+firmware/agent_config.local.h
+*.pem
+build/
+.ruff_cache/
+*.so
