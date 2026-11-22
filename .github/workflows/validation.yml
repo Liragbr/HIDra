@@ -1,0 +1,103 @@
+name: HIDra validation
+on:
+  push:
+    branches: [main, 'engineering/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install pinned tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: Syntax and static checks
+        run: |
+          mkdir -p build/results
+          python -m compileall -q hidra server test scripts
+          ruff check hidra server test scripts | tee build/results/ruff.log
+          bandit -r hidra server test/pico_agent_sim.py -q | tee build/results/bandit.log
+          python scripts/check_security.py | tee build/results/secrets.log
+          bash -n gen_certs.sh scripts/build_firmware.sh test/run_native.sh test/run_mbedtls_host.sh
+      - name: Unit and isolated TLS integration tests
+        run: python -W error::ResourceWarning test/run_tests.py 2>&1 | tee build/results/tests.log
+      - name: Native ASan and UBSan
+        run: bash test/run_native.sh 2>&1 | tee build/results/sanitizers.log
+      - name: Dependency advisory check
+        if: matrix.python == '3.12'
+        run: pip-audit --strict --disable-pip --no-deps -r requirements-dev.txt 2>&1 | tee build/results/dependencies.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: python-${{ matrix.python }}-results
+          path: build/results/
+          if-no-files-found: error
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [pico_w, pico2_w]
+    env:
+      PICO_SDK_PATH: ${{ github.workspace }}/build/deps/pico-sdk
+      PICO_MBEDTLS_PATH: ${{ github.workspace }}/build/deps/mbedtls
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned CMake and Ninja
+        run: python -m pip install cmake==4.4.5 ninja==1.13.2
+      - name: Checkout locked sources
+        run: |
+          mkdir -p build/deps build/results
+          git init "$PICO_SDK_PATH"
+          git -C "$PICO_SDK_PATH" remote add origin https://github.com/raspberrypi/pico-sdk.git
+          git -C "$PICO_SDK_PATH" fetch --depth 1 origin 079c6f39023649b154152db30f1d781e884879bc
+          git -C "$PICO_SDK_PATH" checkout --detach FETCH_HEAD
+          git -C "$PICO_SDK_PATH" submodule update --init --depth 1 lib/cyw43-driver lib/lwip lib/tinyusb
+          git init "$PICO_MBEDTLS_PATH"
+          git -C "$PICO_MBEDTLS_PATH" remote add origin https://github.com/Mbed-TLS/mbedtls.git
+          git -C "$PICO_MBEDTLS_PATH" fetch --depth 1 origin 82e69999f91126589a28b70dd75b69fbcabe2711
+          git -C "$PICO_MBEDTLS_PATH" checkout --detach FETCH_HEAD
+          python scripts/check_dependencies.py | tee build/results/source-lock.log
+      - name: Download and verify Arm GNU toolchain
+        run: |
+          curl --fail --location --retry 3 --max-time 180 -o build/arm.tar.xz https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi.tar.xz
+          echo '8f6903f8ceb084d9227b9ef991490413014d991874a1e34074443c2a72b14dbd  build/arm.tar.xz' | sha256sum -c -
+          tar -xf build/arm.tar.xz -C build/deps
+          echo "$GITHUB_WORKSPACE/build/deps/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi/bin" >> "$GITHUB_PATH"
+      - name: Provision public compile fixture
+        run: python scripts/provision_build_fixture.py
+      - name: Build firmware
+        run: bash scripts/build_firmware.sh '${{ matrix.board }}' 2>&1 | tee build/results/firmware.log
+      - name: Exact mbedTLS config against Python TLS server
+        if: matrix.board == 'pico_w'
+        run: bash test/run_mbedtls_host.sh 2>&1 | tee build/results/mbedtls-host.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: firmware-${{ matrix.board }}-results
+          path: |
+            build/results/
+            firmware/build-${{ matrix.board }}/pico_c2_agent.elf.map
+          if-no-files-found: error
+# Build binaries contain public fixture credentials and are intentionally not published.

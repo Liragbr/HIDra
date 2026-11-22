@@ -1,4 +1,4 @@
-﻿# Pico SDK build artifacts
+# Pico SDK build artifacts
 firmware/build/
 *.uf2
 *.elf

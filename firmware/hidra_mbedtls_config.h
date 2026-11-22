@@ -1,6 +1,6 @@
 #ifndef HIDRA_MBEDTLS_CONFIG_H
 #define HIDRA_MBEDTLS_CONFIG_H
-/* Verified against the pico-sdk 2.3.1 submodule: mbedTLS 3.6.6. */
+/* Verified against the pico-sdk 2.3.1 with external mbedTLS 3.6.8. */
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_PLATFORM_MS_TIME_ALT
 #define MBEDTLS_PLATFORM_TIME_ALT
@@ -18,6 +18,7 @@
 #define MBEDTLS_PSA_CRYPTO_C
 #define MBEDTLS_PSA_CRYPTO_CLIENT
 #define MBEDTLS_USE_PSA_CRYPTO
+/* Keep AES_ROM_TABLES disabled: see CVE-2026-115492. No general side-channel claim. */
 #define MBEDTLS_AES_C
 #define MBEDTLS_GCM_C
 #define MBEDTLS_CIPHER_C

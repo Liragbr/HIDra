@@ -43,6 +43,7 @@ static bool dummy_mac(void *unused, const char *msg, size_t len, char out[65]) {
 int main(void) {
     hid_queue_init(&queue, enter, leave, &mutex);
     assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}));
+    assert(!hid_queue_idle(&queue));
     hid_queue_visit(&queue, enable, NULL);
     for (unsigned i = 0; i < 63; ++i) assert(hid_queue_push(&queue, (hid_key_t){0,1,0}));
     assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}));
@@ -53,6 +54,10 @@ int main(void) {
     assert(pthread_create(&c, NULL, consumer, NULL) == 0);
     assert(pthread_join(p, NULL) == 0 && pthread_join(c, NULL) == 0);
     assert(consumed == 100000 && queue.head == queue.tail);
+    assert(hid_queue_idle(&queue));
+    queue.busy = true;
+    assert(!hid_queue_idle(&queue));
+    queue.busy = false;
     hid_queue_cancel(&queue);
     assert(queue.generation == 2);
 

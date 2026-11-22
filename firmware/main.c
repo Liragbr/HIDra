@@ -20,18 +20,20 @@
 #include "mbedtls/sha256.h"
 
 static hid_queue_t queue;
+static hidra_tls_t tls;
+static absolute_time_t payload_deadline;
 static critical_section_t ring_lock;
 static void enter_queue(void *lock) { critical_section_enter_blocking(lock); }
 static void leave_queue(void *lock) { critical_section_exit(lock); }
 static void cancel_pending(void) { hid_queue_cancel(&queue); }
 static bool enqueue_special(uint8_t modifier, uint8_t keycode, uint16_t delay_ms) {
-    absolute_time_t deadline = make_timeout_time_ms(2000);
     do {
+        if (time_reached(payload_deadline) || tls.eof) return false;
         if (hid_queue_push(&queue, (hid_key_t){modifier, keycode, delay_ms})) return true;
         bool mounted = hid_queue_enabled(&queue);
         if (!mounted) return false;
         hidra_network_poll();
-    } while (!time_reached(deadline));
+    } while (!time_reached(payload_deadline));
     return false;
 }
 static hid_key_t ascii_to_hid(char c) {
@@ -101,11 +103,11 @@ static void service_hid(hid_queue_t *q, void *unused) {
     static uint16_t after_release;
     static uint32_t seen_generation;
     bool mounted = tud_mounted() && !tud_suspended();
-    if (!mounted && q->enabled) { q->tail = q->head; ++q->generation; }
+    if (!mounted && q->enabled) { q->tail = q->head; q->busy = false; ++q->generation; }
     q->enabled = mounted;
     if (seen_generation != q->generation) {
         seen_generation = q->generation;
-        release = true; ready_at = 0; after_release = 0;
+        release = true; ready_at = 0; after_release = 0; q->busy = true;
     }
     uint64_t now = time_us_64();
     if (!mounted || !tud_hid_ready() || now < ready_at) return;
@@ -118,15 +120,18 @@ static void service_hid(hid_queue_t *q, void *unused) {
         hid_key_t key = q->records[q->tail];
         if (!key.keycode && !key.modifier) {
             q->tail = (q->tail + 1) % RING_CAP;
+            q->busy = true;
             ready_at = now + (uint64_t)key.delay_ms * 1000;
         } else {
             uint8_t keys[6] = {key.keycode, 0, 0, 0, 0, 0};
             if (tud_hid_keyboard_report(REPORT_ID_KEYBOARD, key.modifier, keys)) {
                 q->tail = (q->tail + 1) % RING_CAP;
-                release = true; after_release = key.delay_ms;
+                release = true; after_release = key.delay_ms; q->busy = true;
                 ready_at = now + 8000;
             }
         }
+    } else {
+        q->busy = false;
     }
 }
 static void core1_entry(void) {
@@ -206,14 +211,21 @@ static bool enqueue_key_combo(const char *spec) {
 
 
 static bool run_payload(const char *action, const char *payload) {
-    if (!strcmp(action, "type")) return enqueue_string(payload);
-    if (!strcmp(action, "key")) return enqueue_key_combo(payload);
-    /* Already strictly parsed and range checked by hidra_command. */
-    return enqueue_special(0, 0, (uint16_t)strtoul(payload, NULL, 10));
+    /* One deadline covers enqueue AND report completion, not 15 seconds per key. */
+    payload_deadline = make_timeout_time_ms(15000);
+    bool queued;
+    if (!strcmp(action, "type")) queued = enqueue_string(payload);
+    else if (!strcmp(action, "key")) queued = enqueue_key_combo(payload);
+    else queued = enqueue_special(0, 0, (uint16_t)strtoul(payload, NULL, 10));
+    if (!queued) return false;
+    while (!hid_queue_idle(&queue)) {
+        if (time_reached(payload_deadline) || tls.eof || !hid_queue_enabled(&queue)) return false;
+        hidra_network_poll();
+    }
+    return true;
 }
 static uint32_t rate_timestamps[30];
 static unsigned rate_count;
-static hidra_tls_t tls;
 static char line[HIDRA_MAX_FRAME + 1], body[HIDRA_MAX_BODY + 1], sid[65];
 static uint32_t txseq, rxseq;
 

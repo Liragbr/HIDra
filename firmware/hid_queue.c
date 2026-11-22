@@ -22,6 +22,12 @@ bool hid_queue_enabled(hid_queue_t *q) {
     q->leave(q->lock);
     return result;
 }
+bool hid_queue_idle(hid_queue_t *q) {
+    q->enter(q->lock);
+    bool idle = q->enabled && !q->busy && q->head == q->tail;
+    q->leave(q->lock);
+    return idle;
+}
 void hid_queue_cancel(hid_queue_t *q) {
     q->enter(q->lock);
     q->tail = q->head;

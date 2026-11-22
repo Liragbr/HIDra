@@ -25,7 +25,7 @@ class Config:
         self.HMAC_SECRET = os.environ.get("RUNNER_HMAC_SECRET", "")
         self.CERT = os.environ.get("RUNNER_CERT", "server.pem")
         self.KEY = os.environ.get("RUNNER_KEY", "server.key")
-        self.TIMEOUT = 10.0
+        self.TIMEOUT = 20.0
         self.MAX_CLIENTS = 8
 
     def validate(self):
