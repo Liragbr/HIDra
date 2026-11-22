@@ -1,84 +1,65 @@
-cmake_minimum_required(VERSION 3.13)
-
-# ── Pico SDK bootstrap ────────────────────────────────────────────────
-# Set PICO_SDK_PATH env var OR pass -DPICO_SDK_PATH=... to cmake
-include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
-
-project(pico_c2_agent C CXX ASM)
-set(CMAKE_C_STANDARD   11)
-set(CMAKE_CXX_STANDARD 17)
-
-pico_sdk_init()
-
-# ── Optional lab mode (TLS cert verification disabled) ────────────────
-# cmake -DAGENT_LAB_MODE=1 .. to build without cert checking
-option(AGENT_LAB_MODE "Disable TLS certificate verification (lab only)" OFF)
-
-# ── jsmn single-header JSON parser ───────────────────────────────────
-# Download: https://raw.githubusercontent.com/zserge/jsmn/master/jsmn.h
-# Place jsmn.h in this directory and add a jsmn.c shim:
-#   #define JSMN_IMPLEMENTATION
-#   #include "jsmn.h"
-add_library(jsmn STATIC jsmn.c)
-target_include_directories(jsmn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
-# ── Main firmware target ──────────────────────────────────────────────
-add_executable(pico_c2_agent
-    main.c
-    usb_descriptors.c
-)
-
-# Board selection: pass -DPICO_BOARD=pico_w (RP2040) or pico2_w (RP2350)
-# Default to pico_w if not specified
+cmake_minimum_required(VERSION 3.20)
 if(NOT DEFINED PICO_BOARD)
-    set(PICO_BOARD pico_w)
+    set(PICO_BOARD pico_w CACHE STRING "Target board")
 endif()
-
-target_include_directories(pico_c2_agent PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-# ── Link libraries ────────────────────────────────────────────────────
-target_link_libraries(pico_c2_agent
-    # Pico SDK fundamentals
-    pico_stdlib
-    pico_multicore
-    pico_time
-
-    # CYW43 Wi-Fi — threadsafe background mode plays well with TinyUSB
-    pico_cyw43_arch_lwip_threadsafe_background
-
-    # TinyUSB device stack (HID)
-    tinyusb_device
-    tinyusb_board
-
-    # mbedTLS (bundled in pico-sdk via pico_lwip)
-    pico_mbedtls
-
-    # Watchdog for remote reboot on "terminate"
-    hardware_watchdog
-
-    # jsmn JSON parser
-    jsmn
-)
-
-# ── mbedTLS config ────────────────────────────────────────────────────
-# Overrides the pico-sdk default mbedtls_config.h with our lean one
+if(NOT PICO_BOARD STREQUAL "pico_w" AND NOT PICO_BOARD STREQUAL "pico2_w")
+    message(FATAL_ERROR "Supported build targets: pico_w or pico2_w")
+endif()
+if(NOT PICO_SDK_PATH)
+    set(PICO_SDK_PATH "$ENV{PICO_SDK_PATH}")
+endif()
+if(NOT EXISTS "${PICO_SDK_PATH}/external/pico_sdk_import.cmake")
+    message(FATAL_ERROR "Set PICO_SDK_PATH to the pinned pico-sdk checkout")
+endif()
+if(NOT PICO_MBEDTLS_PATH)
+    set(PICO_MBEDTLS_PATH "$ENV{PICO_MBEDTLS_PATH}")
+endif()
+if(NOT EXISTS "${PICO_MBEDTLS_PATH}/include/mbedtls/build_info.h")
+    message(FATAL_ERROR "Set PICO_MBEDTLS_PATH to the separately pinned mbedTLS 3.6.8 checkout")
+endif()
+file(STRINGS "${PICO_MBEDTLS_PATH}/include/mbedtls/build_info.h" MBEDTLS_VERSION_LINE REGEX "^#define MBEDTLS_VERSION_NUMBER")
+if(NOT MBEDTLS_VERSION_LINE MATCHES "0x03060800")
+    message(FATAL_ERROR "mbedTLS 3.6.8 is required; the SDK's 3.6.6 is not the audited dependency")
+endif()
+set(PICO_MBEDTLS_CONFIG_FILE "hidra_mbedtls_config.h")
+include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(pico_c2_agent C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+pico_sdk_init()
+if(NOT PICO_SDK_VERSION_STRING VERSION_EQUAL "2.3.1")
+    message(FATAL_ERROR "This configuration requires pico-sdk 2.3.1")
+endif()
+option(AGENT_LAB_MODE "Disable server certificate verification, isolated labs only" OFF)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/agent_config.local.h")
+    message(FATAL_ERROR "Create agent_config.local.h from the example")
+endif()
+if(NOT AGENT_LAB_MODE AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ca_cert.h")
+    message(FATAL_ERROR "Generate ca_cert.h; do not disable verification to hide a missing CA")
+endif()
+# This is a build-time floor, NOT a trusted wall clock. See docs/SECURITY.md.
+string(TIMESTAMP HIDRA_BUILD_EPOCH "%s" UTC)
+add_executable(pico_c2_agent main.c protocol.c hid_queue.c tls_transport.c usb_descriptors.c)
+target_include_directories(pico_c2_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(pico_c2_agent PRIVATE
-    MBEDTLS_CONFIG_FILE="mbedtls_config.h"
-)
-
-# ── Lab mode flag ─────────────────────────────────────────────────────
+    HIDRA_BUILD_EPOCH=${HIDRA_BUILD_EPOCH}
+    AGENT_LAB_MODE=$<BOOL:${AGENT_LAB_MODE}>
+    PICO_STACK_SIZE=0x6000 PICO_CORE1_STACK_SIZE=0x1000)
 if(AGENT_LAB_MODE)
-    target_compile_definitions(pico_c2_agent PRIVATE AGENT_LAB_MODE=1)
-    message(WARNING "AGENT_LAB_MODE is ON — TLS cert verification disabled!")
+    message(WARNING "LAB MODE: certificate verification disabled")
 endif()
-
-# ── USB / stdio routing ───────────────────────────────────────────────
-# USB stdio → serial monitor while developing; disable in production
-# to free USB for HID-only operation.
-pico_enable_stdio_usb(pico_c2_agent 0)   # 0 = off (HID owns USB)
-pico_enable_stdio_uart(pico_c2_agent 1)  # use UART0 (GP0/GP1) for debug
-
-# ── Generate UF2 + map + disassembly ─────────────────────────────────
+target_link_libraries(pico_c2_agent pico_stdlib pico_multicore pico_time pico_sync
+    pico_cyw43_arch_lwip_poll tinyusb_device tinyusb_board pico_mbedtls hardware_watchdog)
+set_source_files_properties(main.c protocol.c hid_queue.c tls_transport.c usb_descriptors.c
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror;-Wconversion;-Wshadow")
+# Reserve 24 KiB for Core 0 outside the heap. SDK scratch banks are only 4 KiB.
+if(PICO_BOARD STREQUAL "pico_w")
+    target_link_options(pico_c2_agent PRIVATE "LINKER:--defsym,RAM_LENGTH=0x3a000" "LINKER:--defsym,SCRATCH_Y_ORIGIN=0x2003a000")
+else()
+    target_link_options(pico_c2_agent PRIVATE "LINKER:--defsym,RAM_LENGTH=0x7a000" "LINKER:--defsym,SCRATCH_Y_ORIGIN=0x2007a000")
+endif()
+target_link_options(pico_c2_agent PRIVATE "LINKER:--defsym,SCRATCH_Y_LENGTH=0x6000")
+pico_enable_stdio_usb(pico_c2_agent 0)
+pico_enable_stdio_uart(pico_c2_agent 1)
 pico_add_extra_outputs(pico_c2_agent)

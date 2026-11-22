@@ -1,0 +1,14 @@
+{
+  "pico_sdk": {"version": "2.3.1", "commit": "079c6f39023649b154152db30f1d781e884879bc"},
+  "mbedtls": {"version": "3.6.8", "commit": "82e69999f91126589a28b70dd75b69fbcabe2711"},
+  "sdk_submodules": {
+    "lib/cyw43-driver": "055d64274b014dd7b1c2fc94d26e8a18face7124",
+    "lib/lwip": "77dcd25a72509eb83f72b033d219b1d40cd8eb95",
+    "lib/tinyusb": "86ad6e56c1700e85f1c5678607a762cfe3aa2f47"
+  },
+  "arm_gnu_toolchain": {
+    "version": "14.3.rel1",
+    "url": "https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi.tar.xz",
+    "sha256": "8f6903f8ceb084d9227b9ef991490413014d991874a1e34074443c2a72b14dbd"
+  }
+}

@@ -1,501 +1,308 @@
-
 #!/usr/bin/env python3
-"""
-c2_server.py - C2 Server for HIDra (Pico W HID Agent)
-Educational / lab use only.
- 
-Architecture:
-  - Listens on TLS 1.3 (mandatory)
-  - Each accepted connection spawns a handler thread
-  - Operator sends keystroke payloads via an interactive CLI
-    OR by piping a DuckyScript-like file (see --script)
- 
-Security properties:
-  [SEC-1] RUNNER_TOKEN / RUNNER_HMAC_SECRET never logged to stdout.
-  [SEC-3] Constant-time token comparison via hmac.compare_digest().
-  [SEC-4] TLS 1.3 minimum; CA cert + server cert required.
-  [OPS-1] Server honours the agent rate-limit response gracefully.
- 
-Usage:
-  # Interactive mode
-  python3 c2_server.py
- 
-  # Script mode
-  python3 c2_server.py --script payload.duck
- 
-Environment variables:
-  RUNNER_HOST          bind address         (default: 0.0.0.0)
-  RUNNER_PORT          bind port            (default: 9000)
-  RUNNER_TOKEN         auth token           (required)
-  RUNNER_HMAC_SECRET   HMAC signing secret  (optional but recommended)
-  RUNNER_CERT          TLS server cert PEM  (default: server.pem)
-  RUNNER_KEY           TLS server key PEM   (default: server.key)
- 
-DuckyScript subset supported in --script mode:
-  STRING <text>          type text
-  ENTER                  press Enter
-  GUI r                  Win+R (or any modifier combo)
-  CTRL ALT DEL           Ctrl+Alt+Del
-  DELAY <ms>             wait N milliseconds
-  REM <anything>         comment, ignored
-
-  God blessed U - By Lira. 
-"""
- 
+"""Bounded TLS 1.3 laboratory server. Run from the repository root."""
 import argparse
-import hashlib
-import hmac as hmac_mod
-import json
+import logging
 import os
+from pathlib import Path
 import socket
 import ssl
 import sys
 import threading
-import time
-from datetime import datetime, timezone
-from typing import Optional
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §1  Configuration
-# ═══════════════════════════════════════════════════════════════════
- 
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from hidra.protocol import (ProtocolError, RateLimiter, close_socket, ct_equal,
+                            negotiate, validate_command, validate_secret)
+
+LOG = logging.getLogger("hidra.server")
+
+
 class Config:
-    HOST        = os.environ.get("RUNNER_HOST",        "0.0.0.0")
-    PORT        = int(os.environ.get("RUNNER_PORT",    "9000"))
-    TOKEN       = os.environ.get("RUNNER_TOKEN",       "")
-    HMAC_SECRET = os.environ.get("RUNNER_HMAC_SECRET", "")
-    CERT        = os.environ.get("RUNNER_CERT",        "server.pem")
-    KEY         = os.environ.get("RUNNER_KEY",         "server.key")
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §2  Logging
-# ═══════════════════════════════════════════════════════════════════
- 
-_log_lock = threading.Lock()
- 
-def log(level: str, msg: str) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    with _log_lock:
-        print(f"{ts} [{level}] {msg}", flush=True)
- 
-def info(m: str) -> None: log("INFO", m)
-def warn(m: str) -> None: log("WARN", m)
-def crit(m: str) -> None: log("CRIT", m)
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §3  Crypto
-# ═══════════════════════════════════════════════════════════════════
- 
-def hmac_sign(secret: str, msg: str) -> str:
-    return hmac_mod.new(
-        secret.encode(), msg.encode(), hashlib.sha256
-    ).hexdigest()
- 
-def ct_equal(a: str, b: str) -> bool:
-    """[SEC-3] Constant-time string comparison."""
-    return hmac_mod.compare_digest(a, b)
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §4  Protocol helpers
-# ═══════════════════════════════════════════════════════════════════
- 
-class Proto:
-    """Wraps a TLS socket with JSON-envelope send/recv."""
- 
-    def __init__(self, conn: ssl.SSLSocket) -> None:
-        self._conn    = conn
-        self._rbuf    = b""
-        self._MAX     = 64 * 1024
- 
-    def send(self, payload: dict) -> None:
-        body = json.dumps(payload, separators=(',', ':'))
-        sig  = hmac_sign(Config.HMAC_SECRET, body) if Config.HMAC_SECRET else ""
-        env  = json.dumps({"body": body, "sig": sig}, separators=(',', ':'))
-        self._conn.sendall((env + "\n").encode())
- 
-    def recv(self) -> Optional[dict]:
-        """Return next parsed message or None on EOF/error/HMAC fail."""
-        while b"\n" not in self._rbuf:
-            if len(self._rbuf) >= self._MAX:
-                warn("recv buffer overflow - dropping connection")
-                return None
-            try:
-                chunk = self._conn.recv(4096)
-            except (OSError, ssl.SSLError):
-                return None
-            if not chunk:
-                return None
-            self._rbuf += chunk
- 
-        line, self._rbuf = self._rbuf.split(b"\n", 1)
-        line = line.rstrip(b"\r")
- 
-        try:
-            env  = json.loads(line)
-            body = env["body"]
-            sig  = env.get("sig", "")
-        except (json.JSONDecodeError, KeyError):
-            warn("malformed envelope")
-            return {"action": "invalid", "error": "malformed envelope"}
- 
-        # [SEC-3] HMAC verification
-        if Config.HMAC_SECRET:
-            expected = hmac_sign(Config.HMAC_SECRET, body)
-            if not ct_equal(expected, sig):
-                warn("HMAC mismatch - possible tampering")
-                return {"action": "invalid", "error": "hmac mismatch"}
- 
-        try:
-            return json.loads(body)
-        except json.JSONDecodeError:
-            return {"action": "invalid", "error": "malformed body"}
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §5  Payload builder helpers
-# ═══════════════════════════════════════════════════════════════════
- 
-def make_type(text: str) -> dict:
-    return {"action": "type", "text": text}
- 
-def make_key(combo: str) -> dict:
-    return {"action": "key", "keys": combo}
- 
-def make_delay(ms: int) -> dict:
-    return {"action": "delay", "text": str(ms)}
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §6  DuckyScript parser
-# ═══════════════════════════════════════════════════════════════════
- 
-_SPECIAL_KEYS = {
-    "ENTER", "ESC", "TAB", "SPACE", "DEL", "BACKSPACE",
-    "HOME",  "END",  "PGUP", "PGDN",
-    "UP", "DOWN", "LEFT", "RIGHT",
-    "F1","F2","F3","F4","F5","F6",
-    "F7","F8","F9","F10","F11","F12",
-    "WIN", "GUI", "CTRL", "CONTROL", "SHIFT", "ALT",
-}
- 
-def parse_ducky(script: str) -> list:
+    def __init__(self):
+        self.HOST = os.environ.get("RUNNER_HOST", "127.0.0.1")
+        self.PORT = int(os.environ.get("RUNNER_PORT", "9000"))
+        self.TOKEN = os.environ.get("RUNNER_TOKEN", "")
+        self.HMAC_SECRET = os.environ.get("RUNNER_HMAC_SECRET", "")
+        self.CERT = os.environ.get("RUNNER_CERT", "server.pem")
+        self.KEY = os.environ.get("RUNNER_KEY", "server.key")
+        self.TIMEOUT = 20.0
+        self.MAX_CLIENTS = 8
+
+    def validate(self):
+        validate_secret(self.TOKEN)
+        validate_secret(self.HMAC_SECRET)
+        if ct_equal(self.TOKEN, self.HMAC_SECRET):
+            raise ValueError("token and HMAC key must differ")
+        if not 0 <= self.PORT <= 65535 or not 0 < self.MAX_CLIENTS <= 64 or not 0 < self.TIMEOUT <= 120:
+            raise ValueError("invalid server limits")
+
+
+def make_type(text):
+    return validate_command({"action": "type", "text": text})
+
+
+def make_key(combo):
+    return validate_command({"action": "key", "keys": combo})
+
+
+def make_delay(ms):
+    return validate_command({"action": "delay", "text": str(ms)})
+
+
+def parse_ducky(script):
+    """Reject the whole script on any unsupported line, before sending anything."""
     payloads = []
-    for raw_line in script.splitlines():
-        line = raw_line.strip()
-        if not line or line.upper().startswith("REM"):
+    for number, raw in enumerate(script.splitlines(), 1):
+        line = raw.lstrip()
+        command, _, arg = line.partition(" ")
+        command = command.upper()
+        if not line or command == "REM":
             continue
- 
-        upper = line.upper()
- 
-        if upper.startswith("STRING "):
-            payloads.append(make_type(line[7:]))
-            continue
- 
-        if upper.startswith("DELAY "):
-            try:
-                ms = int(line[6:].strip())
-                payloads.append(make_delay(ms))
-            except ValueError:
-                warn(f"invalid DELAY value: {line}")
-            continue
- 
-        tokens = line.upper().split()
-        if all(t in _SPECIAL_KEYS or len(t) == 1 for t in tokens):
-            payloads.append(make_key(line.upper()))
-        else:
-            warn(f"unrecognised ducky line (skipped): {line!r}")
- 
-    return payloads
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §7  Session handler
-# ═══════════════════════════════════════════════════════════════════
- 
-_session_registry: dict = {}
- 
-def handle_session(raw_conn: ssl.SSLSocket, addr: tuple,
-                   script_payloads) -> None:
-    info(f"new connection from {addr[0]}:{addr[1]}")
-    proto = Proto(raw_conn)
- 
-    # Wait for agent auth message
-    msg = proto.recv()
-    if not msg:
-        info(f"{addr[0]} - connection closed before auth")
-        return
- 
-    if msg.get("action") == "invalid":
-        warn(f"{addr[0]} - invalid envelope during auth: {msg.get('error')}")
-        return
- 
-    # [SEC-3] Constant-time token comparison
-    if not Config.TOKEN:
-        crit("RUNNER_TOKEN not configured")
-        proto.send({"ok": False, "error": "server misconfigured"})
-        return
- 
-    token = msg.get("token", "")
-    if not ct_equal(token, Config.TOKEN):
-        proto.send({"ok": False, "error": "authentication failed"})
-        warn(f"{addr[0]} - auth failed")
-        return
- 
-    proto.send({"ok": True, "action": "ok", "message": "authenticated"})
-    info(f"{addr[0]} - authenticated")
- 
-    # Script mode: send pre-built payloads and disconnect
-    if script_payloads is not None:
-        for payload in script_payloads:
-            proto.send(payload)
-            resp = proto.recv()
-            if not resp:
-                warn(f"{addr[0]} - lost connection during script")
-                return
-            if not resp.get("ok"):
-                warn(f"{addr[0]} - payload rejected: {resp.get('error')}")
-            time.sleep(0.05)
- 
-        proto.send({"action": "exit"})
-        info(f"{addr[0]} - script complete, disconnected")
-        return
- 
-    # Interactive mode
-    session = {"alive": True}
-    _session_registry[addr] = (proto, session)
- 
-    info(f"{addr[0]} - session ready (interactive)")
-    try:
-        while session["alive"]:
-            time.sleep(10)
-            proto.send({"action": "ping"})
-            resp = proto.recv()
-            if not resp:
-                break
-    finally:
-        _session_registry.pop(addr, None)
-        info(f"{addr[0]} - session ended")
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §8  Interactive CLI
-# ═══════════════════════════════════════════════════════════════════
- 
-def cli_loop() -> None:
-    """
-    Operator CLI commands:
- 
-      list                  list connected agents
-      use <index>           select active agent
-      type <text>           inject text
-      key <combo>           inject key combo (e.g. WIN r)
-      delay <ms>            sleep on the agent
-      ping                  send a ping
-      script <file>         run a DuckyScript file
-      exit                  send exit to agent
-      terminate             send terminate (agent reboots)
-      quit / q              shut down the server
-    """
-    active_addr = None
- 
-    def get_proto():
-        if active_addr is None:
-            print("  [!] no agent selected - use 'list' then 'use <n>'")
-            return None
-        entry = _session_registry.get(active_addr)
-        if not entry:
-            print("  [!] agent disconnected")
-            return None
-        return entry[0]
- 
-    print("\n  HIDra C2 - interactive console")
-    print("  type 'help' for command list\n")
- 
-    while True:
         try:
-            line = input("c2> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[*] shutting down...")
-            os._exit(0)
- 
-        if not line:
-            continue
- 
-        parts = line.split(" ", 1)
-        cmd   = parts[0].lower()
-        arg   = parts[1] if len(parts) > 1 else ""
- 
-        if cmd in ("quit", "q", "exit_server"):
-            print("[*] shutting down...")
-            os._exit(0)
- 
-        elif cmd == "help":
-            print(cli_loop.__doc__)
- 
-        elif cmd == "list":
-            if not _session_registry:
-                print("  (no agents connected)")
+            if command == "STRING":
+                payload = make_type(arg)
+            elif command == "DELAY":
+                payload = validate_command({"action": "delay", "text": arg.strip()})
             else:
-                for i, addr in enumerate(_session_registry):
-                    marker = ">" if addr == active_addr else " "
-                    print(f"  {marker} [{i}]  {addr[0]}:{addr[1]}")
- 
-        elif cmd == "use":
-            addrs = list(_session_registry.keys())
-            try:
-                idx = int(arg)
-                active_addr = addrs[idx]
-                print(f"  [+] using agent {active_addr[0]}:{active_addr[1]}")
-            except (ValueError, IndexError):
-                print("  [!] invalid index")
- 
-        elif cmd == "type":
-            p = get_proto()
-            if p:
-                p.send(make_type(arg))
-                info(f"type: {arg!r}")
- 
-        elif cmd == "key":
-            p = get_proto()
-            if p:
-                p.send(make_key(arg.upper()))
-                info(f"key: {arg.upper()!r}")
- 
-        elif cmd == "delay":
-            p = get_proto()
-            if p:
-                try:
-                    p.send(make_delay(int(arg)))
-                except ValueError:
-                    print("  [!] delay requires an integer (ms)")
- 
-        elif cmd == "ping":
-            p = get_proto()
-            if p:
-                p.send({"action": "ping"})
-                print("  ping sent")
- 
-        elif cmd == "script":
-            path = arg.strip()
-            if not os.path.isfile(path):
-                print(f"  [!] file not found: {path}")
-                continue
-            p = get_proto()
-            if p:
-                with open(path) as fh:
-                    payloads = parse_ducky(fh.read())
-                print(f"  [+] running {len(payloads)} steps from {path}")
-                for payload in payloads:
-                    p.send(payload)
-                    time.sleep(0.05)
-                print("  [+] script done")
- 
-        elif cmd == "exit":
-            p = get_proto()
-            if p:
-                p.send({"action": "exit"})
-                info("sent exit")
-                active_addr = None
- 
-        elif cmd == "terminate":
-            p = get_proto()
-            if p:
-                p.send({"action": "terminate"})
-                info("sent terminate (agent will reboot)")
-                active_addr = None
- 
-        else:
-            print(f"  [!] unknown command: {cmd!r}  (try 'help')")
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §9  TLS server
-# ═══════════════════════════════════════════════════════════════════
- 
-def build_tls_context() -> ssl.SSLContext:
-    """[SEC-4] TLS 1.3 only."""
+                # Normalize names, keep single letters lower case to avoid implicit SHIFT.
+                tokens = line.split()
+                payload = make_key(" ".join(t.lower() if len(t) == 1 else t.upper() for t in tokens))
+        except ProtocolError as exc:
+            raise ValueError(f"invalid script line {number}") from exc
+        payloads.append(payload)
+        if len(payloads) > 1000:
+            raise ValueError("script exceeds 1000 commands")
+    return payloads
+
+
+def build_tls_context(config):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
- 
-    try:
-        ctx.load_cert_chain(certfile=Config.CERT, keyfile=Config.KEY)
-    except FileNotFoundError as exc:
-        crit(f"TLS cert/key not found: {exc}")
-        crit("Run gen_certs.sh to create a self-signed CA and server cert")
-        sys.exit(1)
- 
+    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(config.CERT, config.KEY)
     return ctx
- 
- 
-def serve(script_payloads) -> None:
-    tls_ctx = build_tls_context()
- 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_srv:
-        raw_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        raw_srv.bind((Config.HOST, Config.PORT))
-        raw_srv.listen(8)
-        info(f"listening on {Config.HOST}:{Config.PORT} (TLS 1.3)")
- 
-        while True:
+
+
+class Session:
+    def __init__(self, proto):
+        self.proto = proto
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def request(self, payload):
+        validate_command(payload)
+        with self.lock:
+            if self.closed:
+                raise EOFError("session closed")
             try:
-                raw_conn, addr = raw_srv.accept()
-            except KeyboardInterrupt:
-                break
- 
-            try:
-                tls_conn = tls_ctx.wrap_socket(raw_conn, server_side=True)
-            except ssl.SSLError as exc:
-                warn(f"TLS handshake failed from {addr[0]}: {exc}")
-                raw_conn.close()
+                self.proto.send(payload)
+                response = self.proto.recv()
+                if type(response.get("ok")) is not bool:
+                    raise ProtocolError("response status")
+                if payload["action"] == "ping" and response != {"ok": True, "action": "pong"}:
+                    raise ProtocolError("unexpected pong")
+                if payload["action"] in {"exit", "terminate"}:
+                    self.closed = True
+                return response
+            except (OSError, EOFError, ValueError):
+                self.closed = True
+                raise
+
+
+class Server:
+    def __init__(self, config, script_payloads=None):
+        config.validate()
+        self.config, self.script = config, script_payloads
+        if script_payloads is not None:
+            for item in script_payloads:
+                validate_command(item)
+        self.context = build_tls_context(config)
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.sessions, self.connections, self.workers = {}, set(), set()
+        self.slots = threading.BoundedSemaphore(config.MAX_CLIENTS)
+        self.admission = RateLimiter(60, 60)
+        self.script_claimed = False
+        self.script_success = False
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener.bind((config.HOST, config.PORT))
+            self.listener.listen(config.MAX_CLIENTS)
+            self.listener.settimeout(0.2)
+        except OSError:
+            self.listener.close()
+            raise
+        self.address = self.listener.getsockname()
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.sessions.items())
+
+    def run(self):
+        LOG.info("listening on %s:%d (TLS 1.3)", *self.address)
+        try:
+            while not self.stop.is_set():
+                try:
+                    raw, addr = self.listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.stop.is_set():
+                        break
+                    raise
+                if not self.admission.allow() or not self.slots.acquire(blocking=False):
+                    raw.close()
+                    LOG.warning("connection admission rejected")
+                    continue
+                worker = threading.Thread(target=self._handle, args=(raw, addr), daemon=True)
+                with self.lock:
+                    self.connections.add(raw)
+                    self.workers.add(worker)
+                try:
+                    worker.start()
+                except RuntimeError:
+                    with self.lock:
+                        self.connections.discard(raw)
+                        self.workers.discard(worker)
+                    raw.close()
+                    self.slots.release()
+                    raise
+        finally:
+            self.shutdown()
+            with self.lock:
+                workers = list(self.workers)
+            for worker in workers:
+                worker.join(self.config.TIMEOUT + 1)
+
+    def _handle(self, raw, addr):
+        conn = raw
+        claimed = False
+        try:
+            raw.settimeout(self.config.TIMEOUT)
+            conn = self.context.wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
+            with self.lock:
+                self.connections.discard(raw)
+                self.connections.add(conn)
+            conn.do_handshake()
+            proto = negotiate(conn, self.config.HMAC_SECRET, "server", self.config.TIMEOUT)
+            msg = proto.recv()
+            if (set(msg) != {"action", "token"} or msg.get("action") != "auth"
+                    or not ct_equal(msg.get("token"), self.config.TOKEN)):
+                proto.send({"ok": False, "error": "authentication failed"})
+                LOG.warning("authentication rejected")
+                return
+            if self.script is not None:
+                with self.lock:
+                    if self.script_claimed:
+                        return
+                    self.script_claimed = claimed = True
+            proto.send({"ok": True, "action": "ok"})
+            session = Session(proto)
+            if self.script is not None:
+                for payload in self.script:
+                    if not session.request(payload)["ok"]:
+                        LOG.warning("script stopped on rejected command")
+                        return
+                self.script_success = session.request({"action": "exit"})["ok"]
+                return
+            with self.lock:
+                self.sessions[addr] = session
+            while not self.stop.wait(10):
+                if session.closed:
+                    break
+                session.request({"action": "ping"})
+        except ssl.SSLError as exc:
+            LOG.warning("TLS failure: %s", exc.reason)
+        except (OSError, EOFError, ValueError):
+            LOG.warning("session closed: transport, authentication or protocol failure")
+        finally:
+            with self.lock:
+                self.sessions.pop(addr, None)
+                self.connections.discard(conn)
+                self.connections.discard(raw)
+                self.workers.discard(threading.current_thread())
+            close_socket(conn)
+            self.slots.release()
+            if claimed:
+                self.stop.set()
+
+    def shutdown(self):
+        self.stop.set()
+        self.listener.close()
+        with self.lock:
+            connections = list(self.connections)
+        for conn in connections:
+            close_socket(conn)
+
+
+def cli_loop(server):
+    active = None
+    print("HIDra: list | use N | type TEXT | key COMBO | delay MS | ping | script FILE | exit | terminate | quit")
+    while not server.stop.is_set():
+        try:
+            command, _, arg = input("hidra> ").partition(" ")
+            if command in {"quit", "q"}:
+                return
+            if command == "list":
+                for index, (addr, _) in enumerate(server.snapshot()):
+                    print(index, addr)
                 continue
- 
-            t = threading.Thread(
-                target=handle_session,
-                args=(tls_conn, addr, script_payloads),
-                daemon=True,
-            )
-            t.start()
- 
- 
-# ═══════════════════════════════════════════════════════════════════
-# §10  Entry point
-# ═══════════════════════════════════════════════════════════════════
- 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="HIDra C2 Server")
-    parser.add_argument(
-        "--script", metavar="FILE",
-        help="DuckyScript file to run on the first connecting agent, then exit"
-    )
+            if command == "use":
+                index = int(arg)
+                if index < 0:
+                    raise ValueError("negative index")
+                active = server.snapshot()[index][1]
+                continue
+            if not active:
+                print("select an agent with use N")
+                continue
+            if command == "script":
+                payloads = parse_ducky(Path(arg).read_text(encoding="utf-8"))
+            elif command == "type":
+                payloads = [make_type(arg)]
+            elif command == "key":
+                payloads = [make_key(arg)]
+            elif command == "delay":
+                payloads = [make_delay(int(arg))]
+            else:
+                payloads = [validate_command({"action": command})]
+            for payload in payloads:
+                response = active.request(payload)
+                print("accepted" if response["ok"] else "rejected; script stopped")
+                if not response["ok"]:
+                    break
+        except (EOFError, KeyboardInterrupt):
+            return
+        except (OSError, ValueError, IndexError):
+            print("invalid input or disconnected session")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--script", help="run once on the first authenticated agent, then exit")
     args = parser.parse_args()
- 
-    if not Config.TOKEN:
-        crit("RUNNER_TOKEN not set - refusing to start")
-        sys.exit(1)
-    if not Config.HMAC_SECRET:
-        warn("RUNNER_HMAC_SECRET not set - message integrity disabled")
- 
-    script_payloads = None
-    if args.script:
-        with open(args.script) as fh:
-            script_payloads = parse_ducky(fh.read())
-        info(f"script loaded: {len(script_payloads)} payloads from {args.script}")
- 
-    server_thread = threading.Thread(
-        target=serve, args=(script_payloads,), daemon=True
-    )
-    server_thread.start()
- 
-    if script_payloads is None:
-        cli_loop()
-    else:
-        server_thread.join()
- 
- 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    try:
+        script = parse_ducky(Path(args.script).read_text(encoding="utf-8")) if args.script else None
+        server = Server(Config(), script)
+        if script is not None:
+            try:
+                server.run()
+            except KeyboardInterrupt:
+                server.shutdown()
+            return 0 if server.script_success else 1
+        thread = threading.Thread(target=server.run)
+        thread.start()
+        try:
+            cli_loop(server)
+        finally:
+            server.shutdown()
+            thread.join()
+        return 0
+    except (OSError, ValueError):
+        LOG.error("startup failed: check credentials, certificate and bind configuration")
+        return 1
+
+
 if __name__ == "__main__":
-    main()
- 
+    raise SystemExit(main())

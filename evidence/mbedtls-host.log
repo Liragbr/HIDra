@@ -1,0 +1,12 @@
+test_reject_expired_certificate (__main__.MbedTLSChecks.test_reject_expired_certificate) ... TLS failure: SSLV3_ALERT_CERTIFICATE_EXPIRED
+ok
+test_reject_wrong_ca (__main__.MbedTLSChecks.test_reject_wrong_ca) ... TLS failure: TLSV1_ALERT_UNKNOWN_CA
+ok
+test_reject_wrong_hostname (__main__.MbedTLSChecks.test_reject_wrong_hostname) ... TLS failure: SSLV3_ALERT_BAD_CERTIFICATE
+ok
+test_valid_tls13_auth_and_exit (__main__.MbedTLSChecks.test_valid_tls13_auth_and_exit) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.875s
+
+OK

@@ -1,0 +1,74 @@
+test_admission_rate_limit (test.test_integration.IntegrationTests.test_admission_rate_limit) ... connection admission rejected
+ok
+test_auth_invalid_token_action_and_type (test.test_integration.IntegrationTests.test_auth_invalid_token_action_and_type) ... authentication rejected
+authentication rejected
+authentication rejected
+ok
+test_auth_timeout (test.test_integration.IntegrationTests.test_auth_timeout) ... session closed: transport, authentication or protocol failure
+ok
+test_bad_response_schema_is_terminal (test.test_integration.IntegrationTests.test_bad_response_schema_is_terminal) ... ok
+test_certificate_generation_no_overwrite_and_private_permissions (test.test_integration.IntegrationTests.test_certificate_generation_no_overwrite_and_private_permissions) ... ok
+test_concurrent_requests_have_single_transaction_owner (test.test_integration.IntegrationTests.test_concurrent_requests_have_single_transaction_owner) ... ok
+test_eof_retries_are_delayed_and_rate_state_survives (test.test_integration.IntegrationTests.test_eof_retries_are_delayed_and_rate_state_survives) ... session closed: transport, authentication or protocol failure
+connection lost; retry scheduled
+session closed: transport, authentication or protocol failure
+ok
+test_expired_certificate (test.test_integration.IntegrationTests.test_expired_certificate) ... session closed: transport, authentication or protocol failure
+ok
+test_failed_connection_retries_with_delay_then_recovers (test.test_integration.IntegrationTests.test_failed_connection_retries_with_delay_then_recovers) ... connection lost; retry scheduled
+connection lost; retry scheduled
+ok
+test_hmac_tampering_closes_auth_connection (test.test_integration.IntegrationTests.test_hmac_tampering_closes_auth_connection) ... session closed: transport, authentication or protocol failure
+ok
+test_malformed_command_and_signature_never_reach_sink (test.test_integration.IntegrationTests.test_malformed_command_and_signature_never_reach_sink) ... ok
+test_missing_and_identical_secrets_refuse_startup (test.test_integration.IntegrationTests.test_missing_and_identical_secrets_refuse_startup) ... ok
+test_no_credentials_or_commands_in_logs (test.test_integration.IntegrationTests.test_no_credentials_or_commands_in_logs) ... ok
+test_rate_limit_exact_30_of_35_and_ping (test.test_integration.IntegrationTests.test_rate_limit_exact_30_of_35_and_ping) ... ok
+test_replayed_auth_from_another_session_is_rejected (test.test_integration.IntegrationTests.test_replayed_auth_from_another_session_is_rejected) ... session closed: transport, authentication or protocol failure
+ok
+test_response_timeout_closes_session (test.test_integration.IntegrationTests.test_response_timeout_closes_session) ... ok
+test_script_exact_events_and_server_exits (test.test_integration.IntegrationTests.test_script_exact_events_and_server_exits) ... ok
+test_script_stops_on_rejection (test.test_integration.IntegrationTests.test_script_stops_on_rejection) ... script stopped on rejected command
+ok
+test_session_limit_and_recovery (test.test_integration.IntegrationTests.test_session_limit_and_recovery) ... connection admission rejected
+session closed: transport, authentication or protocol failure
+ok
+test_stalled_handshake_does_not_block_next_client (test.test_integration.IntegrationTests.test_stalled_handshake_does_not_block_next_client) ... session closed: transport, authentication or protocol failure
+ok
+test_tls12_rejected (test.test_integration.IntegrationTests.test_tls12_rejected) ... TLS failure: UNSUPPORTED_PROTOCOL
+ok
+test_tls13_valid_auth_and_socket_cleanup (test.test_integration.IntegrationTests.test_tls13_valid_auth_and_socket_cleanup) ... ok
+test_wrong_ca_and_hostname (test.test_integration.IntegrationTests.test_wrong_ca_and_hostname) ... TLS failure: TLSV1_ALERT_UNKNOWN_CA
+TLS failure: SSLV3_ALERT_BAD_CERTIFICATE
+ok
+test_all_truncations_rejected (test.test_native.NativeProtocolTests.test_all_truncations_rejected) ... ok
+test_c_encoder_to_python (test.test_native.NativeProtocolTests.test_c_encoder_to_python) ... ok
+test_command_validation_parity (test.test_native.NativeProtocolTests.test_command_validation_parity) ... ok
+test_escape_decoding_and_duplicate_fields (test.test_native.NativeProtocolTests.test_escape_decoding_and_duplicate_fields) ... ok
+test_firmware_rate_limit_at_boot_expiry_and_wrap (test.test_native.NativeProtocolTests.test_firmware_rate_limit_at_boot_expiry_and_wrap) ... ok
+test_invalid_hmac_sequence_session_direction_and_types (test.test_native.NativeProtocolTests.test_invalid_hmac_sequence_session_direction_and_types) ... ok
+test_python_encoder_to_c (test.test_native.NativeProtocolTests.test_python_encoder_to_c) ... ok
+test_small_output_and_oversized_inputs_rejected (test.test_native.NativeProtocolTests.test_small_output_and_oversized_inputs_rejected) ... ok
+test_absolute_deadline_despite_drip_feed (test.test_protocol.ProtocolTests.test_absolute_deadline_despite_drip_feed) ... ok
+test_backoff_bounds (test.test_protocol.ProtocolTests.test_backoff_bounds) ... ok
+test_body_limit (test.test_protocol.ProtocolTests.test_body_limit) ... ok
+test_coalesced_frames (test.test_protocol.ProtocolTests.test_coalesced_frames) ... ok
+test_command_boundaries (test.test_protocol.ProtocolTests.test_command_boundaries) ... ok
+test_ducky_exact_events_and_rejection (test.test_protocol.ProtocolTests.test_ducky_exact_events_and_rejection) ... ok
+test_invalid_encoder_data_is_rejected (test.test_protocol.ProtocolTests.test_invalid_encoder_data_is_rejected) ... ok
+test_invalid_envelope_types_and_fields (test.test_protocol.ProtocolTests.test_invalid_envelope_types_and_fields) ... ok
+test_malformed_duplicate_nested_and_non_ascii (test.test_protocol.ProtocolTests.test_malformed_duplicate_nested_and_non_ascii) ... ok
+test_mutual_session_binding (test.test_protocol.ProtocolTests.test_mutual_session_binding) ... ok
+test_oversize_frame_with_and_without_newline (test.test_protocol.ProtocolTests.test_oversize_frame_with_and_without_newline) ... ok
+test_rate_limit_and_exact_expiry (test.test_protocol.ProtocolTests.test_rate_limit_and_exact_expiry) ... ok
+test_replay_reorder_and_exhaustion (test.test_protocol.ProtocolTests.test_replay_reorder_and_exhaustion) ... ok
+test_round_trip_escaping_fragmented (test.test_protocol.ProtocolTests.test_round_trip_escaping_fragmented) ... ok
+test_secrets_required (test.test_protocol.ProtocolTests.test_secrets_required) ... ok
+test_tampered_signature_body_direction_session (test.test_protocol.ProtocolTests.test_tampered_signature_body_direction_session) ... ok
+test_terminal_error_cannot_resynchronize (test.test_protocol.ProtocolTests.test_terminal_error_cannot_resynchronize) ... ok
+test_truncated_frame_and_clean_eof (test.test_protocol.ProtocolTests.test_truncated_frame_and_clean_eof) ... ok
+
+----------------------------------------------------------------------
+Ran 49 tests in 7.132s
+
+OK
