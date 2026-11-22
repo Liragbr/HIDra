@@ -14,9 +14,10 @@ typedef struct hid_queue {
     void *lock;
 } hid_queue_t;
 void hid_queue_init(hid_queue_t *, hid_lock_fn, hid_lock_fn, void *);
-bool hid_queue_push(hid_queue_t *, hid_key_t);
-bool hid_queue_enabled(hid_queue_t *);
-bool hid_queue_idle(hid_queue_t *);
+uint32_t hid_queue_generation(hid_queue_t *);
+bool hid_queue_push(hid_queue_t *, hid_key_t, uint32_t generation);
+bool hid_queue_active(hid_queue_t *, uint32_t generation);
+bool hid_queue_idle(hid_queue_t *, uint32_t generation);
 void hid_queue_cancel(hid_queue_t *);
 /* Visitor runs under the same lock as producer/cancellation. Never block or re-enter. */
 void hid_queue_visit(hid_queue_t *, void (*visitor)(hid_queue_t *, void *), void *);

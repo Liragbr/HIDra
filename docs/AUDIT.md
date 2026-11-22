@@ -26,6 +26,7 @@ núcleos, fila limitada e TinyUSB.
 | A14 | Média | README sem afirmações físicas/benchmarks fictícios; documentação vinculada a logs e matriz | Projeto ainda não é qualificado para produção |
 | A15 | Média | Reconexão Wi-Fi com prazos; backoff limitado; EOF aplica espera no simulador; rate persiste entre sessões | Backoff não reinicia após sessão; reiniciar o processo zera rate |
 | A16 | Nova / dependência | Revisão dos avisos de novembro de 2026 motivou mbedTLS externo 3.6.8 e repetição de builds/TLS | Revisão não equivale a varredura completa de toda a cadeia embarcada |
+| A17 | Média / revisão final | Comando captura a geração da fila; push/idle/active verificam essa geração sob o mesmo lock. Teste nativo cancela e reabilita a fila: comando antigo não pode inserir nem confirmar sucesso | Fecha uma janela lógica de unplug/remount entre observações do Core 0; temporização física permanece não testada |
 
 ## Mudanças de contrato justificadas
 
@@ -53,6 +54,12 @@ dos avisos recentes exigiu ainda trocar mbedTLS 3.6.6 por 3.6.8 e repetir as evi
 O LeakSanitizer não funcionou no sandbox local sob ptrace. ASan/UBSan executaram com
 LSan desligado; a matriz distingue esse resultado. O workflow tenta LSan normalmente.
 Não foi executado payload de teclado, shell remoto ou teste fora do loopback.
+
+A revisão final identificou uma janela adicional: observar somente `enabled` e fila
+vazia podia perder um cancelamento seguido de remount rápido. Vincular cada comando
+à geração da fila impede esse falso sucesso mesmo quando o endpoint volta a ficar
+disponível antes da próxima observação do produtor. A regressão usa a fila real no
+host, sem alegar reprodução do evento em hardware.
 
 ## O que pode ser defendido tecnicamente
 

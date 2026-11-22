@@ -4,11 +4,17 @@ void hid_queue_init(hid_queue_t *q, hid_lock_fn enter, hid_lock_fn leave, void *
     memset(q, 0, sizeof(*q));
     q->enter = enter; q->leave = leave; q->lock = lock;
 }
-bool hid_queue_push(hid_queue_t *q, hid_key_t key) {
+uint32_t hid_queue_generation(hid_queue_t *q) {
+    q->enter(q->lock);
+    uint32_t generation = q->generation;
+    q->leave(q->lock);
+    return generation;
+}
+bool hid_queue_push(hid_queue_t *q, hid_key_t key, uint32_t generation) {
     bool pushed = false;
     q->enter(q->lock);
     unsigned next = (q->head + 1) % RING_CAP;
-    if (q->enabled && next != q->tail) {
+    if (q->enabled && q->generation == generation && next != q->tail) {
         q->records[q->head] = key;
         q->head = next;
         pushed = true;
@@ -16,15 +22,15 @@ bool hid_queue_push(hid_queue_t *q, hid_key_t key) {
     q->leave(q->lock);
     return pushed;
 }
-bool hid_queue_enabled(hid_queue_t *q) {
+bool hid_queue_active(hid_queue_t *q, uint32_t generation) {
     q->enter(q->lock);
-    bool result = q->enabled;
+    bool result = q->enabled && q->generation == generation;
     q->leave(q->lock);
     return result;
 }
-bool hid_queue_idle(hid_queue_t *q) {
+bool hid_queue_idle(hid_queue_t *q, uint32_t generation) {
     q->enter(q->lock);
-    bool idle = q->enabled && !q->busy && q->head == q->tail;
+    bool idle = q->enabled && q->generation == generation && !q->busy && q->head == q->tail;
     q->leave(q->lock);
     return idle;
 }

@@ -31,7 +31,7 @@ idênticos byte a byte sem controlar também essas entradas.
 | Certificados sem sobrescrita e permissões | PASS | Segunda geração falha; chave original preservada; nenhum bit de acesso para grupo/outros |
 | Logs sem credenciais/payload | PASS | Asserções sobre logs de falha; conteúdo não incluído |
 | ASan + UBSan nativos | PASS | [log](../evidence/native-sanitizers.log); 50.000 casos de parser e todas as truncagens do frame de referência |
-| Fila nativa | PASS | Capacidade útil 63, cancelamento, idle/busy; 100.000 registros FIFO entre duas threads com campos exatos |
+| Fila nativa | PASS | Capacidade útil 63, cancelamento, idle/busy, geração antiga rejeitada após reativação; 100.000 registros FIFO entre duas threads com campos exatos |
 | LeakSanitizer local | **NOT TESTED** | Tentativa falhou por ptrace; [diagnóstico](../evidence/lsan-unavailable.log). ASan/UBSan foram executados com `detect_leaks=0` |
 | Sintaxe Python, Ruff, Bandit, sintaxe shell | PASS | [log estático](../evidence/static-analysis.log); comandos de [LAB.md](LAB.md) |
 | GCC warnings/análise do codec e fila | PASS | `-Wall -Wextra -Werror -Wconversion -Wshadow -fanalyzer -c` |
@@ -39,7 +39,7 @@ idênticos byte a byte sem controlar também essas entradas.
 | Build Pico W / RP2040, verificação TLS ligada | **PASS — ELF e UF2** | [log](../evidence/build-pico_w.log), saída zero; nenhuma gravação de placa |
 | Build Pico 2 W / RP2350 Arm, verificação TLS ligada | **PASS — ELF e UF2** | [log](../evidence/build-pico2_w.log), saída zero; nenhum teste RISC-V |
 | Build com bypass TLS | NOT TESTED | Não necessário à validação principal; não alegado como aprovado |
-| GitHub Actions remoto | NOT TESTED | Será atualizado com run/commit verificáveis após publicar a branch |
+| GitHub Actions remoto | **PASS — snapshot inicial** | [Run 45019697373](https://github.com/Liragbr/HIDra/actions/runs/45019697373), commit `a0efb9657f392f9884b1dc7cf7df479477a6e1dd`: cinco jobs aprovados (Python 3.11/3.12/3.13 e duas placas). Revalidação de A17 será registrada após execução |
 | Enumeração, layout, press/release no host USB | **NOT TESTED** | Hardware/host físico indisponíveis |
 | CYW43, lwIP raw e recuperação Wi-Fi em placa | **NOT TESTED** | BIO POSIX do teste mbedTLS não emula rádio/lwIP |
 | Heap/stack máximos, energia, latência e soak físico | **NOT TESTED** | Tamanho de ELF/UF2 não mede uso máximo de memória nem desempenho |
@@ -51,8 +51,8 @@ idênticos byte a byte sem controlar também essas entradas.
 
 | Alvo | text (bytes) | data (bytes) | bss (bytes) |
 |---|---:|---:|---:|
-| pico_w | 512512 | 0 | 73820 |
-| pico2_w | 487604 | 0 | 73180 |
+| pico_w | 512656 | 0 | 73824 |
+| pico2_w | 487700 | 0 | 73184 |
 
 Esses números descrevem seções do ELF com os fixtures de build. Não são benchmark,
 heap máximo, stack máxima ou margem operacional validada. Reservas de stack e o

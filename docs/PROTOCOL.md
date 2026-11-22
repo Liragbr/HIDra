@@ -74,6 +74,8 @@ com no máximo oito workers simultâneos por padrão, incluindo handshakes.
 
 ## Semântica de aceitação e encerramento
 
+Cada comando captura a geração da fila. Cancelamento/unmount altera essa geração;
+mesmo após remount, o comando antigo não pode inserir registros nem confirmar sucesso.
 O firmware confirma quando a fila e as esperas de liberação/delay terminam e o
 endpoint está pronto novamente. Não há confirmação da aplicação no host USB. Delay entra na mesma fila e mantém a ordem. O simulador confirma registro em
 memória e **não dorme para emular tempo de USB**. Não é um emulador de temporização.

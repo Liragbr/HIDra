@@ -22,6 +22,7 @@
 static hid_queue_t queue;
 static hidra_tls_t tls;
 static absolute_time_t payload_deadline;
+static uint32_t payload_generation;
 static critical_section_t ring_lock;
 static void enter_queue(void *lock) { critical_section_enter_blocking(lock); }
 static void leave_queue(void *lock) { critical_section_exit(lock); }
@@ -29,9 +30,8 @@ static void cancel_pending(void) { hid_queue_cancel(&queue); }
 static bool enqueue_special(uint8_t modifier, uint8_t keycode, uint16_t delay_ms) {
     do {
         if (time_reached(payload_deadline) || tls.eof) return false;
-        if (hid_queue_push(&queue, (hid_key_t){modifier, keycode, delay_ms})) return true;
-        bool mounted = hid_queue_enabled(&queue);
-        if (!mounted) return false;
+        if (hid_queue_push(&queue, (hid_key_t){modifier, keycode, delay_ms}, payload_generation)) return true;
+        if (!hid_queue_active(&queue, payload_generation)) return false;
         hidra_network_poll();
     } while (!time_reached(payload_deadline));
     return false;
@@ -213,13 +213,14 @@ static bool enqueue_key_combo(const char *spec) {
 static bool run_payload(const char *action, const char *payload) {
     /* One deadline covers enqueue AND report completion, not 15 seconds per key. */
     payload_deadline = make_timeout_time_ms(15000);
+    payload_generation = hid_queue_generation(&queue);
     bool queued;
     if (!strcmp(action, "type")) queued = enqueue_string(payload);
     else if (!strcmp(action, "key")) queued = enqueue_key_combo(payload);
     else queued = enqueue_special(0, 0, (uint16_t)strtoul(payload, NULL, 10));
     if (!queued) return false;
-    while (!hid_queue_idle(&queue)) {
-        if (time_reached(payload_deadline) || tls.eof || !hid_queue_enabled(&queue)) return false;
+    while (!hid_queue_idle(&queue, payload_generation)) {
+        if (time_reached(payload_deadline) || tls.eof || !hid_queue_active(&queue, payload_generation)) return false;
         hidra_network_poll();
     }
     return true;

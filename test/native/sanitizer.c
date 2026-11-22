@@ -25,9 +25,10 @@ static void consume(hid_queue_t *q, void *unused) {
 }
 static void *producer(void *unused) {
     (void)unused;
+    uint32_t generation = hid_queue_generation(&queue);
     for (unsigned i = 0; i < 100000; ++i) {
         hid_key_t key = {(uint8_t)(i >> 16), (uint8_t)i, (uint16_t)i};
-        while (!hid_queue_push(&queue, key)) sched_yield();
+        while (!hid_queue_push(&queue, key, generation)) sched_yield();
     }
     return NULL;
 }
@@ -42,21 +43,30 @@ static bool dummy_mac(void *unused, const char *msg, size_t len, char out[65]) {
 }
 int main(void) {
     hid_queue_init(&queue, enter, leave, &mutex);
-    assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}));
-    assert(!hid_queue_idle(&queue));
+    uint32_t generation = hid_queue_generation(&queue);
+    assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}, generation));
+    assert(!hid_queue_idle(&queue, generation));
     hid_queue_visit(&queue, enable, NULL);
-    for (unsigned i = 0; i < 63; ++i) assert(hid_queue_push(&queue, (hid_key_t){0,1,0}));
-    assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}));
+    for (unsigned i = 0; i < 63; ++i) assert(hid_queue_push(&queue, (hid_key_t){0,1,0}, generation));
+    assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}, generation));
     hid_queue_cancel(&queue);
     assert(queue.head == queue.tail && queue.generation == 1);
+    /* A remount must not let a canceled command enqueue or report success. */
+    hid_queue_visit(&queue, enable, NULL);
+    assert(!hid_queue_active(&queue, generation));
+    assert(!hid_queue_push(&queue, (hid_key_t){0,1,0}, generation));
+    assert(!hid_queue_idle(&queue, generation));
+    generation = hid_queue_generation(&queue);
+    assert(hid_queue_active(&queue, generation));
+    assert(hid_queue_idle(&queue, generation));
     pthread_t p, c;
     assert(pthread_create(&p, NULL, producer, NULL) == 0);
     assert(pthread_create(&c, NULL, consumer, NULL) == 0);
     assert(pthread_join(p, NULL) == 0 && pthread_join(c, NULL) == 0);
     assert(consumed == 100000 && queue.head == queue.tail);
-    assert(hid_queue_idle(&queue));
+    assert(hid_queue_idle(&queue, generation));
     queue.busy = true;
-    assert(!hid_queue_idle(&queue));
+    assert(!hid_queue_idle(&queue, generation));
     queue.busy = false;
     hid_queue_cancel(&queue);
     assert(queue.generation == 2);
@@ -85,6 +95,6 @@ int main(void) {
         (void)hidra_command(line, action, payload);
         if (n < HIDRA_MAX_BODY) (void)hidra_quote(line, out, sizeof(out));
     }
-    puts("PASS: queue capacity/cancel/FIFO with 100000 concurrent records; 50000 parser cases; all truncations");
+    puts("PASS: queue capacity/cancel/remount generation/FIFO with 100000 concurrent records; 50000 parser cases; all truncations");
     return 0;
 }
