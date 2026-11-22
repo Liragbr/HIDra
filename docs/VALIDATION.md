@@ -1,6 +1,7 @@
 # Matriz de validação
 
-Execução local em 2026-11-22, Linux x86_64, Python 3.12.14, OpenSSL 3.5.7,
+Execução local em 2026-11-22, Linux x86_64, Python 3.12.14, OpenSSL 3.5.8
+no módulo `ssl` do Python e 3.5.7 na ferramenta CLI/libcrypto do sistema,
 GCC host 14.2.0, Arm GNU 14.3.rel1 / GCC 14.3.1, CMake 4.4.5, Ninja 1.13.2.
 Fontes: pico-sdk 2.3.1 + mbedTLS externo 3.6.8, commits de
 [dependencies.lock.json](../dependencies.lock.json).
@@ -33,13 +34,14 @@ idênticos byte a byte sem controlar também essas entradas.
 | ASan + UBSan nativos | PASS | [log](../evidence/native-sanitizers.log); 50.000 casos de parser e todas as truncagens do frame de referência |
 | Fila nativa | PASS | Capacidade útil 63, cancelamento, idle/busy, geração antiga rejeitada após reativação; 100.000 registros FIFO entre duas threads com campos exatos |
 | LeakSanitizer local | **NOT TESTED** | Tentativa falhou por ptrace; [diagnóstico](../evidence/lsan-unavailable.log). ASan/UBSan foram executados com `detect_leaks=0` |
+| LeakSanitizer no GitHub Actions | PASS | `run_native.sh` com `detect_leaks=1` nos três jobs Python; saída zero. Escopo: parser/fila C, não heap TLS nem dispositivo |
 | Sintaxe Python, Ruff, Bandit, sintaxe shell | PASS | [log estático](../evidence/static-analysis.log); comandos de [LAB.md](LAB.md) |
 | GCC warnings/análise do codec e fila | PASS | `-Wall -Wextra -Werror -Wconversion -Wshadow -fanalyzer -c` |
 | Dependências Python | PASS | `pip-audit --disable-pip --no-deps -r requirements-dev.txt`; [log](../evidence/dependency-audit.log). Resultado é consulta de advisories, não garantia absoluta |
 | Build Pico W / RP2040, verificação TLS ligada | **PASS — ELF e UF2** | [log](../evidence/build-pico_w.log), saída zero; nenhuma gravação de placa |
 | Build Pico 2 W / RP2350 Arm, verificação TLS ligada | **PASS — ELF e UF2** | [log](../evidence/build-pico2_w.log), saída zero; nenhum teste RISC-V |
 | Build com bypass TLS | NOT TESTED | Não necessário à validação principal; não alegado como aprovado |
-| GitHub Actions remoto | **PASS — snapshot inicial** | [Run 45019697373](https://github.com/Liragbr/HIDra/actions/runs/45019697373), commit `a0efb9657f392f9884b1dc7cf7df479477a6e1dd`: cinco jobs aprovados (Python 3.11/3.12/3.13 e duas placas). Revalidação de A17 será registrada após execução |
+| GitHub Actions remoto | **PASS — cinco jobs** | [Run 45019960542](https://github.com/Liragbr/HIDra/actions/runs/45019960542), commit `5d55c18511f2d373f88a8d09e6a4d9bca75218d3`, incluindo A17: Python 3.11/3.12/3.13 e builds Pico W/Pico 2 W; [registro dos jobs/artefatos](../evidence/github-actions.json) |
 | Enumeração, layout, press/release no host USB | **NOT TESTED** | Hardware/host físico indisponíveis |
 | CYW43, lwIP raw e recuperação Wi-Fi em placa | **NOT TESTED** | BIO POSIX do teste mbedTLS não emula rádio/lwIP |
 | Heap/stack máximos, energia, latência e soak físico | **NOT TESTED** | Tamanho de ELF/UF2 não mede uso máximo de memória nem desempenho |
@@ -59,6 +61,12 @@ heap máximo, stack máxima ou margem operacional validada. Reservas de stack e 
 mapa de linker devem ser examinados separadamente de alocações dinâmicas TLS.
 
 ## Cobertura e lacunas
+
+A execução remota do PR confirmou 49 testes em cada versão Python, os quatro
+testes mbedTLS no job Pico W, sanitizadores nativos, análise estática e ambos os
+builds ELF/UF2. Os artefatos de CI contêm logs/mapas, não binários provisionados;
+possuem retenção limitada conforme o registro JSON. O SHA da tabela identifica
+exatamente a revisão de código dessa evidência, separada de atualizações documentais.
 
 Os testes C exercitam o parser/codec/fila de produção, não uma reimplementação deles.
 O adaptador criptográfico de vetores usa OpenSSL; a integração adicional usa mbedTLS

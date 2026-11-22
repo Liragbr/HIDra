@@ -52,7 +52,8 @@ foram validados por novas compilações e teste TLS com a configuração real. A
 dos avisos recentes exigiu ainda trocar mbedTLS 3.6.6 por 3.6.8 e repetir as evidências.
 
 O LeakSanitizer não funcionou no sandbox local sob ptrace. ASan/UBSan executaram com
-LSan desligado; a matriz distingue esse resultado. O workflow tenta LSan normalmente.
+LSan desligado; a matriz distingue esse resultado. O workflow executou LSan com
+sucesso nos testes nativos de parser/fila; isso não valida o heap TLS ou a placa.
 Não foi executado payload de teclado, shell remoto ou teste fora do loopback.
 
 A revisão final identificou uma janela adicional: observar somente `enabled` e fila
